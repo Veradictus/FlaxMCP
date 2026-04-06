@@ -995,6 +995,24 @@ namespace FlaxMCP
         /// <summary>
         /// Escapes a string as a JSON string literal with surrounding quotes.
         /// </summary>
+        /// <summary>
+        /// Normalizes Windows-style backslashes to forward slashes in path strings.
+        /// </summary>
+        private static string NormalizePath(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+                return path;
+            return path.Replace('\\', '/');
+        }
+
+        /// <summary>
+        /// JSON-escapes a path string, normalizing backslashes to forward slashes first.
+        /// </summary>
+        private static string JsonEscapePath(string value)
+        {
+            return JsonEscape(NormalizePath(value));
+        }
+
         private static string JsonEscape(string value)
         {
             if (value == null)
@@ -1403,7 +1421,7 @@ namespace FlaxMCP
                         results.Add(BuildJsonObject(
                             "name", child.ShortName,
                             "type", assetItem.TypeName,
-                            "path", child.Path,
+                            "path", NormalizePath(child.Path),
                             "id", assetItem.ID.ToString()
                         ));
                     }
@@ -1435,7 +1453,7 @@ namespace FlaxMCP
                         results.Add(BuildJsonObject(
                             "name", child.ShortName,
                             "type", assetItem.TypeName,
-                            "path", child.Path,
+                            "path", NormalizePath(child.Path),
                             "id", assetItem.ID.ToString()
                         ));
                     }
@@ -1443,7 +1461,7 @@ namespace FlaxMCP
             }
         }
 
-        private void CollectContentTree(ContentFolder folder, StringBuilder sb, int indent)
+        private void CollectContentTree(ContentFolder folder, StringBuilder sb, int indent, int maxDepth = -1, int currentDepth = 0)
         {
             if (folder == null)
                 return;
@@ -1453,7 +1471,7 @@ namespace FlaxMCP
 
             sb.AppendLine($"{pad}{{");
             sb.AppendLine($"{innerPad}\"name\": {JsonEscape(folder.ShortName)},");
-            sb.AppendLine($"{innerPad}\"path\": {JsonEscape(folder.Path)},");
+            sb.AppendLine($"{innerPad}\"path\": {JsonEscapePath(folder.Path)},");
             sb.AppendLine($"{innerPad}\"type\": \"Folder\",");
 
             // Count direct child assets
@@ -1462,13 +1480,16 @@ namespace FlaxMCP
 
             sb.AppendLine($"{innerPad}\"children\": [");
 
-            var childFolders = folder.Children.Where(c => c is ContentFolder).ToList();
-            for (int i = 0; i < childFolders.Count; i++)
+            if (maxDepth < 0 || currentDepth < maxDepth)
             {
-                CollectContentTree((ContentFolder)childFolders[i], sb, indent + 2);
-                if (i < childFolders.Count - 1)
-                    sb.Append(",");
-                sb.AppendLine();
+                var childFolders = folder.Children.Where(c => c is ContentFolder).ToList();
+                for (int i = 0; i < childFolders.Count; i++)
+                {
+                    CollectContentTree((ContentFolder)childFolders[i], sb, indent + 2, maxDepth, currentDepth + 1);
+                    if (i < childFolders.Count - 1)
+                        sb.Append(",");
+                    sb.AppendLine();
+                }
             }
 
             sb.AppendLine($"{innerPad}]");
