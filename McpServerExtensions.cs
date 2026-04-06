@@ -1045,7 +1045,7 @@ namespace FlaxMCP
                     sb.AppendLine($"      \"name\": {JsonEscape(src.Name)},");
                     sb.AppendLine($"      \"id\": {JsonEscape(src.ID.ToString())},");
                     sb.AppendLine($"      \"clip\": {JsonEscape(src.Clip?.Path ?? "none")},");
-                    sb.AppendLine($"      \"isPlaying\": {(src.IsActuallyPlayingSth ? "true" : "false")},");
+                    sb.AppendLine($"      \"isPlaying\": {(src.IsActuallyPlaying ? "true" : "false")},");
                     sb.AppendLine($"      \"isLooping\": {(src.IsLooping ? "true" : "false")},");
                     sb.AppendLine($"      \"volume\": {src.Volume},");
                     sb.AppendLine($"      \"position\": {{ \"X\": {pos.X}, \"Y\": {pos.Y}, \"Z\": {pos.Z} }}");

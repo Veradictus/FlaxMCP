@@ -673,10 +673,10 @@ namespace FlaxMCP
             sb.Append("  \"tags\": [");
             if (actor.Tags != null && actor.Tags.Length > 0)
             {
-                for (int t = 0; t < actor.Tags.Length; t++)
+                for (int ti = 0; ti < actor.Tags.Length; ti++)
                 {
-                    sb.Append(JsonEscape(actor.Tags[t].ToString()));
-                    if (t < actor.Tags.Length - 1)
+                    sb.Append(JsonEscape(actor.Tags[ti].ToString()));
+                    if (ti < actor.Tags.Length - 1)
                         sb.Append(", ");
                 }
             }
