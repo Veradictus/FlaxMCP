@@ -1939,7 +1939,7 @@ namespace FlaxMCP
             {
                 try
                 {
-                    Navigation.BuildNavMesh(new BoundingBox(new Vector3(-100000), new Vector3(100000)), Level.Scenes[0]);
+                    Navigation.BuildNavMesh(Level.Scenes.Length > 0 ? Level.Scenes[0] : null);
                     return BuildJsonObject("ok", "true", "status", "navmesh_build_requested");
                 }
                 catch (Exception ex)
