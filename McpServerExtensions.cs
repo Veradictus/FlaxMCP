@@ -9,223 +9,1522 @@ using System.Text;
 using System.Threading;
 using FlaxEditor;
 using FlaxEditor.Content;
+using FlaxEditor.Content.Settings;
 using FlaxEngine;
 
 namespace FlaxMCP
 {
-    /// <summary>
-    /// Extension methods for <see cref="McpServer"/> that add comprehensive
-    /// engine system coverage: physics, animation, terrain, navigation,
-    /// rendering, audio, prefabs, scene management, content database,
-    /// build/export, editor state, and scripting endpoints.
-    /// </summary>
     public partial class McpServer
     {
         // ------------------------------------------------------------------
-        // Extension route dispatch
+        // Tool registration
         // ------------------------------------------------------------------
 
         /// <summary>
-        /// Attempts to handle a request path that was not matched by the core
-        /// switch statement. Returns <c>true</c> if the route was handled.
+        /// Registers every MCP tool. Called once during <see cref="Start"/>.
         /// </summary>
-        private bool HandleExtensionRoute(string path, string method, HttpListenerContext context, HttpListenerResponse response, NameValueCollection query)
+        private void RegisterAllTools()
         {
-            switch (path)
-            {
-                // -- Physics --
-                case "/physics/raycast":
-                    HandlePhysicsRaycast(response, query);
-                    return true;
+            _tools.Clear();
 
-                case "/physics/overlap":
-                    HandlePhysicsOverlap(response, query);
-                    return true;
+            // ============================================================
+            // Health & Status
+            // ============================================================
 
-                case "/physics/settings":
-                    if (method == "POST")
-                        HandlePhysicsSettingsSet(context, response);
-                    else
-                        HandlePhysicsSettingsGet(response);
-                    return true;
+            RegisterTool("get_health",
+                "Get server status, engine version, and play mode state.",
+                SchemaEmpty(),
+                ToolGetHealth);
 
-                // -- Animation --
-                case "/animation/list":
-                    HandleAnimationList(response, query);
-                    return true;
+            RegisterTool("get_project_status",
+                "Get project compile status, scene count, asset count, and recent errors.",
+                SchemaEmpty(),
+                ToolGetProjectStatus);
 
-                case "/animation/play":
-                    RequirePost(method, response, () => HandleAnimationPlay(context, response));
-                    return true;
+            RegisterTool("get_editor_state",
+                "Get editor state including play mode, project name, viewport info, and selection.",
+                SchemaEmpty(),
+                ToolGetEditorState);
 
-                case "/animation/state":
-                    HandleAnimationState(response, query);
-                    return true;
+            RegisterTool("get_editor_logs",
+                "Get recent editor log entries.",
+                SchemaObject(SchemaPropInt("count", "Number of log entries to retrieve (default 50)")),
+                ToolGetEditorLogs);
 
-                // -- Terrain --
-                case "/terrain/info":
-                    HandleTerrainInfo(response);
-                    return true;
+            // ============================================================
+            // Scene
+            // ============================================================
 
-                case "/terrain/sculpt":
-                    RequirePost(method, response, () => HandleTerrainSculpt(context, response));
-                    return true;
+            RegisterTool("get_scene_hierarchy",
+                "Get the full scene hierarchy tree with all actors.",
+                SchemaEmpty(),
+                ToolGetSceneHierarchy);
 
-                case "/terrain/height":
-                    HandleTerrainHeight(response, query);
-                    return true;
+            RegisterTool("get_scene_list",
+                "List all scene assets and currently loaded scenes.",
+                SchemaEmpty(),
+                ToolGetSceneList);
 
-                // -- Navigation --
-                case "/navigation/build":
-                    RequirePost(method, response, () => HandleNavigationBuild(response));
-                    return true;
+            RegisterTool("get_actor",
+                "Get detailed information about a specific actor.",
+                SchemaObject(
+                    SchemaPropStr("name", "Actor name to find"),
+                    SchemaPropStr("id", "Actor GUID to find")),
+                ToolGetActor);
 
-                case "/navigation/query":
-                    HandleNavigationQuery(response, query);
-                    return true;
+            RegisterTool("find_actors",
+                "Search for actors by name, type, or tag. All filters are optional.",
+                SchemaObject(
+                    SchemaPropStr("name", "Partial name match"),
+                    SchemaPropStr("type", "Actor type name (e.g. StaticModel, PointLight)"),
+                    SchemaPropStr("tag", "Tag to match")),
+                ToolFindActors);
 
-                case "/navigation/info":
-                    HandleNavigationInfo(response);
-                    return true;
+            RegisterTool("set_actor_property",
+                "Set a property on an actor by name or id.",
+                SchemaObjectRequired(
+                    new[] { "property" },
+                    SchemaPropStr("actorName", "Actor name"),
+                    SchemaPropStr("actorId", "Actor GUID"),
+                    SchemaPropStr("property", "Property path (e.g. Transform.Position, IsActive)"),
+                    SchemaPropAny("value", "Value to set")),
+                ToolSetActorProperty);
 
-                // -- Rendering --
-                case "/rendering/screenshot":
-                    RequirePost(method, response, () => HandleRenderingScreenshot(context, response));
-                    return true;
+            RegisterTool("create_actor",
+                "Create a new actor in the scene.",
+                SchemaObjectRequired(
+                    new[] { "type" },
+                    SchemaPropStr("type", "Actor type (EmptyActor, StaticModel, PointLight, Camera, etc.)"),
+                    SchemaPropStr("name", "Actor name"),
+                    SchemaPropStr("parent", "Parent actor name"),
+                    SchemaPropNum("positionX", "X position"),
+                    SchemaPropNum("positionY", "Y position"),
+                    SchemaPropNum("positionZ", "Z position"),
+                    SchemaPropNum("rotationX", "X rotation (Euler degrees)"),
+                    SchemaPropNum("rotationY", "Y rotation (Euler degrees)"),
+                    SchemaPropNum("rotationZ", "Z rotation (Euler degrees)"),
+                    SchemaPropStr("model", "Model asset path (for StaticModel type)")),
+                ToolCreateActor);
 
-                case "/rendering/settings":
-                    if (method == "POST")
-                        HandleRenderingSettingsSet(context, response);
-                    else
-                        HandleRenderingSettingsGet(response);
-                    return true;
+            RegisterTool("delete_actor",
+                "Delete an actor from the scene.",
+                SchemaObject(
+                    SchemaPropStr("name", "Actor name"),
+                    SchemaPropStr("id", "Actor GUID")),
+                ToolDeleteActor);
 
-                // -- Audio --
-                case "/audio/play":
-                    RequirePost(method, response, () => HandleAudioPlay(context, response));
-                    return true;
+            RegisterTool("reparent_actor",
+                "Move an actor to a new parent.",
+                SchemaObject(
+                    SchemaPropStr("actor", "Actor name"),
+                    SchemaPropStr("actorId", "Actor GUID"),
+                    SchemaPropStr("newParent", "New parent actor name"),
+                    SchemaPropStr("newParentId", "New parent actor GUID")),
+                ToolReparentActor);
 
-                case "/audio/sources":
-                    HandleAudioSources(response);
-                    return true;
+            RegisterTool("create_scene",
+                "Create a new scene asset.",
+                SchemaObject(
+                    SchemaPropStr("name", "Scene name"),
+                    SchemaPropStr("path", "Output path (e.g. Content/MyScene.scene)")),
+                ToolCreateScene);
 
-                // -- Prefabs --
-                case "/prefabs/spawn":
-                    RequirePost(method, response, () => HandlePrefabSpawn(context, response));
-                    return true;
+            RegisterTool("save_scene",
+                "Save all currently loaded scenes.",
+                SchemaEmpty(),
+                ToolSaveScene);
 
-                case "/prefabs/list":
-                    HandlePrefabsList(response);
-                    return true;
+            RegisterTool("load_scene",
+                "Load a scene by asset path.",
+                SchemaObjectRequired(
+                    new[] { "path" },
+                    SchemaPropStr("path", "Scene asset path")),
+                ToolLoadScene);
 
-                // -- Scene Management --
-                case "/scene/create":
-                    RequirePost(method, response, () => HandleSceneCreate(context, response));
-                    return true;
+            // ============================================================
+            // Assets & Content
+            // ============================================================
 
-                case "/scene/save":
-                    RequirePost(method, response, () => HandleSceneSave(response));
-                    return true;
+            RegisterTool("list_assets",
+                "List assets in a content folder.",
+                SchemaObject(
+                    SchemaPropStr("path", "Folder path (default: Content)"),
+                    SchemaPropStr("type", "File extension filter (e.g. fbx, flax)")),
+                ToolListAssets);
 
-                case "/scene/load":
-                    RequirePost(method, response, () => HandleSceneLoad(context, response));
-                    return true;
+            RegisterTool("import_assets",
+                "Import external files into the project.",
+                SchemaObjectRequired(
+                    new[] { "files" },
+                    SchemaPropArray("files", "Array of absolute file paths to import"),
+                    SchemaPropStr("target", "Target content folder (default: Content)"),
+                    SchemaPropBool("skipDialog", "Skip the import settings dialog (default: true)")),
+                ToolImportAssets);
 
-                case "/scene/list":
-                    HandleSceneList(response);
-                    return true;
+            RegisterTool("find_content",
+                "Find a content item by its path in the content database.",
+                SchemaObjectRequired(
+                    new[] { "path" },
+                    SchemaPropStr("path", "Content path (e.g. Content/Materials/M_Base.flax)")),
+                ToolFindContent);
 
-                case "/scene/actor/create":
-                    RequirePost(method, response, () => HandleActorCreate(context, response));
-                    return true;
+            RegisterTool("search_content",
+                "Search the content database by name and/or type.",
+                SchemaObject(
+                    SchemaPropStr("query", "Name search query"),
+                    SchemaPropStr("type", "Asset type filter (e.g. Model, Texture)")),
+                ToolSearchContent);
 
-                case "/scene/actor/delete":
-                    RequirePost(method, response, () => HandleActorDelete(context, response));
-                    return true;
+            RegisterTool("get_content_info",
+                "Get detailed information about a content item.",
+                SchemaObjectRequired(
+                    new[] { "path" },
+                    SchemaPropStr("path", "Content item path")),
+                ToolGetContentInfo);
 
-                case "/scene/actor/reparent":
-                    RequirePost(method, response, () => HandleActorReparent(context, response));
-                    return true;
+            RegisterTool("reimport_content",
+                "Reimport an asset from its source file.",
+                SchemaObjectRequired(
+                    new[] { "path" },
+                    SchemaPropStr("path", "Asset path to reimport")),
+                ToolReimportContent);
 
-                // -- Content Database --
-                case "/content/search":
-                    HandleContentSearch(response, query);
-                    return true;
+            RegisterTool("get_content_tree",
+                "Get the full content directory tree structure.",
+                SchemaEmpty(),
+                ToolGetContentTree);
 
-                case "/content/reimport":
-                    RequirePost(method, response, () => HandleContentReimport(context, response));
-                    return true;
+            // ============================================================
+            // Materials
+            // ============================================================
 
-                case "/content/info":
-                    HandleContentInfo(response, query);
-                    return true;
+            RegisterTool("create_material",
+                "Create a new material asset.",
+                SchemaObjectRequired(
+                    new[] { "name", "outputPath" },
+                    SchemaPropStr("name", "Material name"),
+                    SchemaPropStr("outputPath", "Output path relative to project folder")),
+                ToolCreateMaterial);
 
-                // -- Build / Export --
-                case "/build/game":
-                    RequirePost(method, response, () => HandleBuildGame(context, response));
-                    return true;
+            RegisterTool("create_material_instance",
+                "Create a material instance from a base material.",
+                SchemaObjectRequired(
+                    new[] { "name", "outputPath" },
+                    SchemaPropStr("name", "Instance name"),
+                    SchemaPropStr("outputPath", "Output path relative to project folder"),
+                    SchemaPropStr("baseMaterial", "Base material asset path"),
+                    SchemaPropAny("parameters", "Parameter overrides as key-value pairs")),
+                ToolCreateMaterialInstance);
 
-                case "/build/status":
-                    HandleBuildStatus(response);
-                    return true;
+            // ============================================================
+            // Physics
+            // ============================================================
 
-                // -- Editor State --
-                case "/editor/state":
-                    HandleEditorState(response);
-                    return true;
+            RegisterTool("physics_raycast",
+                "Cast a ray and return hit information.",
+                SchemaObject(
+                    SchemaPropNum("originX", "Ray origin X"),
+                    SchemaPropNum("originY", "Ray origin Y"),
+                    SchemaPropNum("originZ", "Ray origin Z"),
+                    SchemaPropNum("directionX", "Ray direction X"),
+                    SchemaPropNum("directionY", "Ray direction Y (default: -1)"),
+                    SchemaPropNum("directionZ", "Ray direction Z"),
+                    SchemaPropNum("maxDistance", "Maximum ray distance (default: 1000)")),
+                ToolPhysicsRaycast);
 
-                case "/editor/select":
-                    RequirePost(method, response, () => HandleEditorSelect(context, response));
-                    return true;
+            RegisterTool("physics_overlap",
+                "Perform a sphere overlap test and return intersecting actors.",
+                SchemaObject(
+                    SchemaPropNum("x", "Sphere center X"),
+                    SchemaPropNum("y", "Sphere center Y"),
+                    SchemaPropNum("z", "Sphere center Z"),
+                    SchemaPropNum("radius", "Sphere radius (default: 5)")),
+                ToolPhysicsOverlap);
 
-                case "/editor/focus":
-                    RequirePost(method, response, () => HandleEditorFocus(context, response));
-                    return true;
+            RegisterTool("get_physics_settings",
+                "Get current physics settings (gravity, CCD, etc.).",
+                SchemaEmpty(),
+                ToolGetPhysicsSettings);
 
-                case "/editor/viewport":
-                    if (method == "POST")
-                        HandleEditorViewportSet(context, response);
-                    else
-                        HandleEditorViewportGet(response);
-                    return true;
+            RegisterTool("set_physics_settings",
+                "Set physics settings such as gravity.",
+                SchemaObject(
+                    SchemaPropNum("gravityX", "Gravity X component"),
+                    SchemaPropNum("gravityY", "Gravity Y component"),
+                    SchemaPropNum("gravityZ", "Gravity Z component")),
+                ToolSetPhysicsSettings);
 
-                // -- Scripting --
-                case "/scripts/list":
-                    HandleScriptsList(response);
-                    return true;
+            // ============================================================
+            // Animation
+            // ============================================================
 
-                case "/scripts/compile":
-                    RequirePost(method, response, () => HandleScriptsCompile(response));
-                    return true;
+            RegisterTool("list_animations",
+                "List animated models in the current scene.",
+                SchemaObject(
+                    SchemaPropStr("actor", "Actor name to inspect (searches all if omitted)")),
+                ToolListAnimations);
 
-                case "/scripts/errors":
-                    HandleScriptsErrors(response);
-                    return true;
+            RegisterTool("play_animation",
+                "Play or configure animation on an animated model.",
+                SchemaObjectRequired(
+                    new[] { "actor" },
+                    SchemaPropStr("actor", "Actor name"),
+                    SchemaPropStr("clip", "Animation clip path"),
+                    SchemaPropNum("speed", "Playback speed multiplier"),
+                    SchemaPropStr("parameter", "Animation graph parameter name to set"),
+                    SchemaPropAny("parameterValue", "Value for the animation parameter")),
+                ToolPlayAnimation);
 
-                default:
-                    return false;
-            }
+            RegisterTool("get_animation_state",
+                "Get the current animation state of an actor.",
+                SchemaObjectRequired(
+                    new[] { "actor" },
+                    SchemaPropStr("actor", "Actor name or id")),
+                ToolGetAnimationState);
+
+            // ============================================================
+            // Terrain
+            // ============================================================
+
+            RegisterTool("get_terrain_info",
+                "Get information about terrain actors in the scene.",
+                SchemaEmpty(),
+                ToolGetTerrainInfo);
+
+            RegisterTool("terrain_sculpt",
+                "Sculpt terrain at a world position.",
+                SchemaObject(
+                    SchemaPropStr("terrainName", "Terrain actor name (uses first if omitted)"),
+                    SchemaPropNum("x", "World X position"),
+                    SchemaPropNum("z", "World Z position"),
+                    SchemaPropNum("radius", "Brush radius (default: 5)"),
+                    SchemaPropNum("strength", "Brush strength (default: 0.5)")),
+                ToolTerrainSculpt);
+
+            RegisterTool("get_terrain_height",
+                "Sample terrain height at a world X/Z position.",
+                SchemaObject(
+                    SchemaPropNum("x", "World X position"),
+                    SchemaPropNum("z", "World Z position")),
+                ToolGetTerrainHeight);
+
+            // ============================================================
+            // Navigation
+            // ============================================================
+
+            RegisterTool("build_navmesh",
+                "Build the navigation mesh for the current scene.",
+                SchemaEmpty(),
+                ToolBuildNavmesh);
+
+            RegisterTool("query_navpath",
+                "Query a navigation path between two world positions.",
+                SchemaObject(
+                    SchemaPropNum("startX", "Start X"), SchemaPropNum("startY", "Start Y"), SchemaPropNum("startZ", "Start Z"),
+                    SchemaPropNum("endX", "End X"), SchemaPropNum("endY", "End Y"), SchemaPropNum("endZ", "End Z")),
+                ToolQueryNavpath);
+
+            RegisterTool("get_navigation_info",
+                "Get navigation mesh volume information.",
+                SchemaEmpty(),
+                ToolGetNavigationInfo);
+
+            // ============================================================
+            // Rendering
+            // ============================================================
+
+            RegisterTool("take_screenshot",
+                "Capture a screenshot of the editor viewport.",
+                SchemaObjectRequired(
+                    new[] { "outputPath" },
+                    SchemaPropStr("outputPath", "Absolute or project-relative output file path")),
+                ToolTakeScreenshot);
+
+            RegisterTool("get_rendering_settings",
+                "Get current rendering and post-processing settings.",
+                SchemaEmpty(),
+                ToolGetRenderingSettings);
+
+            RegisterTool("set_rendering_settings",
+                "Update rendering settings.",
+                SchemaObject(
+                    SchemaPropAny("settings", "Rendering setting key-value pairs")),
+                ToolSetRenderingSettings);
+
+            // ============================================================
+            // Audio
+            // ============================================================
+
+            RegisterTool("play_audio",
+                "Play an audio clip at a position in the scene.",
+                SchemaObjectRequired(
+                    new[] { "clip" },
+                    SchemaPropStr("clip", "Audio clip asset path"),
+                    SchemaPropNum("positionX", "X position"),
+                    SchemaPropNum("positionY", "Y position"),
+                    SchemaPropNum("positionZ", "Z position"),
+                    SchemaPropBool("loop", "Loop the audio (default: false)")),
+                ToolPlayAudio);
+
+            RegisterTool("list_audio_sources",
+                "List all audio source actors in the scene.",
+                SchemaEmpty(),
+                ToolListAudioSources);
+
+            // ============================================================
+            // Prefabs
+            // ============================================================
+
+            RegisterTool("spawn_prefab",
+                "Spawn a prefab instance in the scene.",
+                SchemaObjectRequired(
+                    new[] { "prefab" },
+                    SchemaPropStr("prefab", "Prefab asset path"),
+                    SchemaPropStr("name", "Instance name"),
+                    SchemaPropStr("parent", "Parent actor name"),
+                    SchemaPropNum("positionX", "X position"),
+                    SchemaPropNum("positionY", "Y position"),
+                    SchemaPropNum("positionZ", "Z position"),
+                    SchemaPropNum("rotationX", "X rotation (Euler degrees)"),
+                    SchemaPropNum("rotationY", "Y rotation (Euler degrees)"),
+                    SchemaPropNum("rotationZ", "Z rotation (Euler degrees)")),
+                ToolSpawnPrefab);
+
+            RegisterTool("list_prefabs",
+                "List all prefab assets in the project.",
+                SchemaEmpty(),
+                ToolListPrefabs);
+
+            // ============================================================
+            // Editor Control
+            // ============================================================
+
+            RegisterTool("editor_play",
+                "Start play mode in the editor.",
+                SchemaEmpty(),
+                ToolEditorPlay);
+
+            RegisterTool("editor_stop",
+                "Stop play mode in the editor.",
+                SchemaEmpty(),
+                ToolEditorStop);
+
+            RegisterTool("editor_select",
+                "Select an actor in the editor.",
+                SchemaObject(
+                    SchemaPropStr("name", "Actor name"),
+                    SchemaPropStr("id", "Actor GUID")),
+                ToolEditorSelect);
+
+            RegisterTool("editor_focus",
+                "Focus the editor viewport on an actor.",
+                SchemaObject(
+                    SchemaPropStr("name", "Actor name"),
+                    SchemaPropStr("id", "Actor GUID")),
+                ToolEditorFocus);
+
+            RegisterTool("get_viewport",
+                "Get the editor viewport camera position and orientation.",
+                SchemaEmpty(),
+                ToolGetViewport);
+
+            RegisterTool("set_viewport",
+                "Set the editor viewport camera position and orientation.",
+                SchemaObject(
+                    SchemaPropNum("positionX", "Camera X position"),
+                    SchemaPropNum("positionY", "Camera Y position"),
+                    SchemaPropNum("positionZ", "Camera Z position"),
+                    SchemaPropNum("yaw", "Camera yaw in degrees"),
+                    SchemaPropNum("pitch", "Camera pitch in degrees")),
+                ToolSetViewport);
+
+            // ============================================================
+            // Scripts
+            // ============================================================
+
+            RegisterTool("list_scripts",
+                "List all C# script files in the project Source folder.",
+                SchemaEmpty(),
+                ToolListScripts);
+
+            RegisterTool("read_script",
+                "Read the source code of a script file.",
+                SchemaObjectRequired(
+                    new[] { "path" },
+                    SchemaPropStr("path", "Script path relative to project folder (e.g. Source/Game/MyScript.cs)")),
+                ToolReadScript);
+
+            RegisterTool("compile_scripts",
+                "Trigger script compilation.",
+                SchemaEmpty(),
+                ToolCompileScripts);
+
+            RegisterTool("get_script_errors",
+                "Get script compilation errors and warnings.",
+                SchemaEmpty(),
+                ToolGetScriptErrors);
+
+            // ============================================================
+            // Build
+            // ============================================================
+
+            RegisterTool("build_game",
+                "Request a game build for a target platform.",
+                SchemaObject(
+                    SchemaPropStr("platform", "Target platform (default: Windows)"),
+                    SchemaPropStr("configuration", "Build configuration (default: Release)")),
+                ToolBuildGame);
+
+            RegisterTool("get_build_status",
+                "Get the current build status.",
+                SchemaEmpty(),
+                ToolGetBuildStatus);
+
+            // ============================================================
+            // Project Settings
+            // ============================================================
+
+            RegisterTool("get_project_settings",
+                "Read the GameSettings.json and return project configuration.",
+                SchemaEmpty(),
+                ToolGetProjectSettings);
+
+            RegisterTool("set_project_settings",
+                "Update GameSettings fields such as productName and companyName.",
+                SchemaObject(
+                    SchemaPropStr("productName", "Product name"),
+                    SchemaPropStr("companyName", "Company name")),
+                ToolSetProjectSettings);
         }
 
         // ==================================================================
-        // PHYSICS
+        // JSON Schema helpers for tool input definitions
         // ==================================================================
 
-        // ------------------------------------------------------------------
-        // GET /physics/raycast?originX=0&originY=10&originZ=0&dirX=0&dirY=-1&dirZ=0&maxDist=100
-        // ------------------------------------------------------------------
-
-        private void HandlePhysicsRaycast(HttpListenerResponse response, NameValueCollection query)
+        private static string SchemaEmpty()
         {
-            float originX = ParseFloat(query["originX"], 0f);
-            float originY = ParseFloat(query["originY"], 0f);
-            float originZ = ParseFloat(query["originZ"], 0f);
-            float dirX = ParseFloat(query["dirX"], 0f);
-            float dirY = ParseFloat(query["dirY"], -1f);
-            float dirZ = ParseFloat(query["dirZ"], 0f);
-            float maxDist = ParseFloat(query["maxDist"], 1000f);
+            return "{\"type\":\"object\",\"properties\":{},\"required\":[]}";
+        }
 
-            var result = InvokeOnMainThread(() =>
+        private static string SchemaObject(params string[] props)
+        {
+            return SchemaObjectRequired(Array.Empty<string>(), props);
+        }
+
+        private static string SchemaObjectRequired(string[] required, params string[] props)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"type\":\"object\",\"properties\":{");
+            for (int i = 0; i < props.Length; i++)
+            {
+                if (i > 0) sb.Append(",");
+                sb.Append(props[i]);
+            }
+            sb.Append("},\"required\":[");
+            for (int i = 0; i < required.Length; i++)
+            {
+                if (i > 0) sb.Append(",");
+                sb.Append($"\"{required[i]}\"");
+            }
+            sb.Append("]}");
+            return sb.ToString();
+        }
+
+        private static string SchemaPropStr(string name, string desc)
+        {
+            return $"\"{name}\":{{\"type\":\"string\",\"description\":\"{EscapeSchemaString(desc)}\"}}";
+        }
+
+        private static string SchemaPropNum(string name, string desc)
+        {
+            return $"\"{name}\":{{\"type\":\"number\",\"description\":\"{EscapeSchemaString(desc)}\"}}";
+        }
+
+        private static string SchemaPropInt(string name, string desc)
+        {
+            return $"\"{name}\":{{\"type\":\"integer\",\"description\":\"{EscapeSchemaString(desc)}\"}}";
+        }
+
+        private static string SchemaPropBool(string name, string desc)
+        {
+            return $"\"{name}\":{{\"type\":\"boolean\",\"description\":\"{EscapeSchemaString(desc)}\"}}";
+        }
+
+        private static string SchemaPropArray(string name, string desc)
+        {
+            return $"\"{name}\":{{\"type\":\"array\",\"items\":{{\"type\":\"string\"}},\"description\":\"{EscapeSchemaString(desc)}\"}}";
+        }
+
+        private static string SchemaPropAny(string name, string desc)
+        {
+            return $"\"{name}\":{{\"description\":\"{EscapeSchemaString(desc)}\"}}";
+        }
+
+        private static string EscapeSchemaString(string s)
+        {
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        // ==================================================================
+        // TOOL HANDLERS: Health & Status
+        // ==================================================================
+
+        private string ToolGetHealth(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                return BuildJsonObject(
+                    "status", "ok",
+                    "engine", "FlaxEngine",
+                    "version", Globals.EngineBuildNumber.ToString(),
+                    "project", Globals.ProductName,
+                    "isPlaying", Editor.Instance.StateMachine.IsPlayMode.ToString().ToLowerInvariant()
+                );
+            });
+        }
+
+        private string ToolGetProjectStatus(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                var scenes = Level.Scenes;
+                var sceneCount = scenes?.Length ?? 0;
+
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.AppendLine($"  \"projectName\": {JsonEscape(Globals.ProductName)},");
+                sb.AppendLine($"  \"isCompiling\": {(ScriptsBuilder.IsCompiling ? "true" : "false")},");
+                sb.AppendLine($"  \"lastCompilationFailed\": {(ScriptsBuilder.LastCompilationFailed ? "true" : "false")},");
+                sb.AppendLine($"  \"loadedSceneCount\": {sceneCount},");
+
+                // Count assets in Content folder
+                var assetCount = 0;
+                try
+                {
+                    var contentRoot = Editor.Instance.ContentDatabase.Game.Content.Folder;
+                    var assetItems = new List<string>();
+                    CollectContentItemsByType(contentRoot, null, assetItems);
+                    assetCount = assetItems.Count;
+                }
+                catch { }
+
+                sb.AppendLine($"  \"totalAssetCount\": {assetCount},");
+
+                // Recent errors
+                List<LogEntry> errors;
+                lock (_logLock)
+                {
+                    errors = _logBuffer
+                        .Where(e => e.Level == "Error" || e.Level == "Exception")
+                        .TakeLast(10)
+                        .ToList();
+                }
+
+                sb.AppendLine($"  \"recentErrorCount\": {errors.Count},");
+                sb.AppendLine("  \"recentErrors\": [");
+                for (int i = 0; i < errors.Count; i++)
+                {
+                    sb.AppendLine("    {");
+                    sb.AppendLine($"      \"level\": {JsonEscape(errors[i].Level)},");
+                    sb.AppendLine($"      \"message\": {JsonEscape(errors[i].Message)},");
+                    sb.AppendLine($"      \"timestamp\": {JsonEscape(errors[i].Timestamp)}");
+                    sb.Append("    }");
+                    if (i < errors.Count - 1) sb.Append(",");
+                    sb.AppendLine();
+                }
+                sb.AppendLine("  ]");
+                sb.Append("}");
+                return sb.ToString();
+            });
+        }
+
+        private string ToolGetEditorState(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+
+                sb.AppendLine($"  \"isPlaying\": {(Editor.Instance.StateMachine.IsPlayMode ? "true" : "false")},");
+                sb.AppendLine($"  \"isPaused\": {(Editor.Instance.StateMachine.PlayingState.IsPaused ? "true" : "false")},");
+                sb.AppendLine($"  \"projectName\": {JsonEscape(Globals.ProductName)},");
+                sb.AppendLine($"  \"projectFolder\": {JsonEscape(Globals.ProjectFolder)},");
+
+                var scenes = Level.Scenes;
+                sb.AppendLine("  \"loadedScenes\": [");
+                if (scenes != null)
+                {
+                    for (int i = 0; i < scenes.Length; i++)
+                    {
+                        sb.Append($"    {JsonEscape(scenes[i].Name)}");
+                        if (i < scenes.Length - 1) sb.Append(",");
+                        sb.AppendLine();
+                    }
+                }
+                sb.AppendLine("  ],");
+
+                var selection = Editor.Instance.SceneEditing.Selection;
+                sb.AppendLine($"  \"selectionCount\": {selection.Count},");
+                sb.AppendLine("  \"selectedActors\": [");
+                for (int i = 0; i < selection.Count; i++)
+                {
+                    var node = selection[i];
+                    if (node is FlaxEditor.SceneGraph.ActorNode actorNode && actorNode.Actor != null)
+                    {
+                        sb.AppendLine("    {");
+                        sb.AppendLine($"      \"name\": {JsonEscape(actorNode.Actor.Name)},");
+                        sb.AppendLine($"      \"type\": {JsonEscape(actorNode.Actor.GetType().Name)},");
+                        sb.AppendLine($"      \"id\": {JsonEscape(actorNode.Actor.ID.ToString())}");
+                        sb.Append("    }");
+                    }
+                    else
+                    {
+                        sb.Append($"    {{ \"name\": {JsonEscape(node.Name)}, \"type\": \"SceneGraphNode\" }}");
+                    }
+                    if (i < selection.Count - 1) sb.Append(",");
+                    sb.AppendLine();
+                }
+                sb.AppendLine("  ],");
+
+                sb.AppendLine($"  \"undoCount\": {Editor.Instance.Undo.UndoOperationsStack.HistoryCount},");
+                sb.AppendLine($"  \"canUndo\": {(Editor.Instance.Undo.CanUndo ? "true" : "false")},");
+                sb.AppendLine($"  \"canRedo\": {(Editor.Instance.Undo.CanRedo ? "true" : "false")}");
+
+                sb.Append("}");
+                return sb.ToString();
+            });
+        }
+
+        private string ToolGetEditorLogs(Dictionary<string, object> args)
+        {
+            int count = GetArgInt(args, "count", 50);
+            count = Math.Min(count, MaxLogEntries);
+
+            List<LogEntry> entries;
+            lock (_logLock)
+            {
+                var start = Math.Max(0, _logBuffer.Count - count);
+                entries = _logBuffer.GetRange(start, _logBuffer.Count - start);
+            }
+
+            var sb = new StringBuilder();
+            sb.AppendLine("{");
+            sb.AppendLine($"  \"count\": {entries.Count},");
+            sb.AppendLine("  \"logs\": [");
+
+            for (int i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                sb.AppendLine("    {");
+                sb.AppendLine($"      \"level\": {JsonEscape(entry.Level)},");
+                sb.AppendLine($"      \"message\": {JsonEscape(entry.Message)},");
+                sb.AppendLine($"      \"timestamp\": {JsonEscape(entry.Timestamp)}");
+                sb.Append("    }");
+                if (i < entries.Count - 1) sb.Append(",");
+                sb.AppendLine();
+            }
+
+            sb.AppendLine("  ]");
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        // ==================================================================
+        // TOOL HANDLERS: Scene
+        // ==================================================================
+
+        private string ToolGetSceneHierarchy(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                var scenes = Level.Scenes;
+                if (scenes == null || scenes.Length == 0)
+                    return BuildJsonObject("error", "No scenes loaded.");
+
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.AppendLine("  \"scenes\": [");
+
+                for (int s = 0; s < scenes.Length; s++)
+                {
+                    sb.Append("    ");
+                    BuildActorJson(sb, scenes[s], 2);
+                    if (s < scenes.Length - 1) sb.Append(",");
+                    sb.AppendLine();
+                }
+
+                sb.AppendLine("  ]");
+                sb.Append("}");
+                return sb.ToString();
+            });
+        }
+
+        private string ToolGetSceneList(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                var items = new List<string>();
+                CollectContentItemsByType(Editor.Instance.ContentDatabase.Game.Content.Folder, "Scene", items);
+
+                var loadedScenes = Level.Scenes;
+
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+
+                sb.AppendLine("  \"loadedScenes\": [");
+                if (loadedScenes != null)
+                {
+                    for (int i = 0; i < loadedScenes.Length; i++)
+                    {
+                        var scene = loadedScenes[i];
+                        sb.AppendLine("    {");
+                        sb.AppendLine($"      \"name\": {JsonEscape(scene.Name)},");
+                        sb.AppendLine($"      \"id\": {JsonEscape(scene.ID.ToString())}");
+                        sb.Append("    }");
+                        if (i < loadedScenes.Length - 1) sb.Append(",");
+                        sb.AppendLine();
+                    }
+                }
+                sb.AppendLine("  ],");
+
+                sb.AppendLine($"  \"assetCount\": {items.Count},");
+                sb.AppendLine("  \"sceneAssets\": [");
+                for (int i = 0; i < items.Count; i++)
+                {
+                    sb.Append($"    {items[i]}");
+                    if (i < items.Count - 1) sb.Append(",");
+                    sb.AppendLine();
+                }
+                sb.AppendLine("  ]");
+                sb.Append("}");
+                return sb.ToString();
+            });
+        }
+
+        private string ToolGetActor(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                var actor = ResolveActor(args);
+                if (actor == null)
+                {
+                    var identifier = GetArgString(args, "name") ?? GetArgString(args, "id") ?? "unknown";
+                    return BuildJsonObject("error", $"Actor not found: {identifier}");
+                }
+
+                return BuildActorDetailJson(actor);
+            });
+        }
+
+        private string ToolFindActors(Dictionary<string, object> args)
+        {
+            var nameQuery = GetArgString(args, "name");
+            var typeQuery = GetArgString(args, "type");
+            var tagQuery = GetArgString(args, "tag");
+
+            return InvokeOnMainThread(() =>
+            {
+                var matches = new List<Actor>();
+                var scenes = Level.Scenes;
+
+                if (scenes == null || scenes.Length == 0)
+                    return BuildJsonObject("error", "No scenes loaded.");
+
+                foreach (var scene in scenes)
+                    CollectMatchingActors(scene, nameQuery, typeQuery, tagQuery, matches);
+
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.AppendLine($"  \"count\": {matches.Count},");
+                sb.AppendLine("  \"actors\": [");
+
+                for (int i = 0; i < matches.Count; i++)
+                {
+                    var a = matches[i];
+                    var pos = a.Position;
+                    sb.AppendLine("    {");
+                    sb.AppendLine($"      \"name\": {JsonEscape(a.Name)},");
+                    sb.AppendLine($"      \"type\": {JsonEscape(a.GetType().Name)},");
+                    sb.AppendLine($"      \"id\": {JsonEscape(a.ID.ToString())},");
+                    sb.AppendLine($"      \"position\": {{ \"X\": {pos.X}, \"Y\": {pos.Y}, \"Z\": {pos.Z} }}");
+                    sb.Append("    }");
+                    if (i < matches.Count - 1) sb.Append(",");
+                    sb.AppendLine();
+                }
+
+                sb.AppendLine("  ]");
+                sb.Append("}");
+                return sb.ToString();
+            });
+        }
+
+        private string ToolSetActorProperty(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                var actor = ResolveActor(args);
+                if (actor == null)
+                {
+                    var identifier = GetArgString(args, "actorName") ?? GetArgString(args, "actorId") ?? "unknown";
+                    return BuildJsonObject("error", $"Actor not found: {identifier}");
+                }
+
+                var property = GetArgString(args, "property");
+                if (string.IsNullOrEmpty(property))
+                    return BuildJsonObject("error", "Missing 'property' argument.");
+
+                args.TryGetValue("value", out var value);
+
+                try
+                {
+                    SetPropertyByPath(actor, property, value);
+                    return BuildJsonObject(
+                        "ok", "true",
+                        "actor", actor.Name,
+                        "property", property
+                    );
+                }
+                catch (Exception ex)
+                {
+                    return BuildJsonObject("error", $"Failed to set property: {ex.Message}");
+                }
+            });
+        }
+
+        private string ToolCreateActor(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                var scenes = Level.Scenes;
+                if (scenes == null || scenes.Length == 0)
+                    return BuildJsonObject("error", "No scenes loaded.");
+
+                Actor parent = scenes[0];
+                var parentName = GetArgString(args, "parent");
+                if (!string.IsNullOrEmpty(parentName))
+                {
+                    var found = FindActorByName(parentName);
+                    if (found != null)
+                        parent = found;
+                }
+
+                var typeName = GetArgString(args, "type");
+                if (string.IsNullOrEmpty(typeName))
+                    return BuildJsonObject("error", "Missing 'type' argument.");
+
+                Actor newActor = null;
+                try
+                {
+                    switch (typeName)
+                    {
+                        case "EmptyActor": newActor = new EmptyActor(); break;
+                        case "StaticModel": newActor = new StaticModel(); break;
+                        case "PointLight": newActor = new PointLight(); break;
+                        case "SpotLight": newActor = new SpotLight(); break;
+                        case "DirectionalLight": newActor = new DirectionalLight(); break;
+                        case "Camera": newActor = new Camera(); break;
+                        case "AudioSource": newActor = new AudioSource(); break;
+                        case "BoxCollider": newActor = new BoxCollider(); break;
+                        case "SphereCollider": newActor = new SphereCollider(); break;
+                        case "MeshCollider": newActor = new MeshCollider(); break;
+                        case "RigidBody": newActor = new RigidBody(); break;
+                        case "AnimatedModel": newActor = new AnimatedModel(); break;
+                        case "Decal": newActor = new Decal(); break;
+                        case "Sky": newActor = new Sky(); break;
+                        case "SkyLight": newActor = new SkyLight(); break;
+                        case "ExponentialHeightFog": newActor = new ExponentialHeightFog(); break;
+                        case "PostFxVolume": newActor = new PostFxVolume(); break;
+                        case "TextRender": newActor = new TextRender(); break;
+                        case "UICanvas": newActor = new UICanvas(); break;
+                        case "UIControl": newActor = new UIControl(); break;
+                        default:
+                            Type resolvedType = Type.GetType(typeName);
+                            if (resolvedType == null)
+                                resolvedType = typeof(Actor).Assembly.GetType("FlaxEngine." + typeName);
+                            if (resolvedType != null && typeof(Actor).IsAssignableFrom(resolvedType))
+                                newActor = Activator.CreateInstance(resolvedType) as Actor;
+                            break;
+                    }
+
+                    if (newActor == null)
+                        return BuildJsonObject("error", $"Unknown or unsupported actor type: {typeName}");
+                }
+                catch (Exception ex)
+                {
+                    return BuildJsonObject("error", $"Failed to create actor: {ex.Message}");
+                }
+
+                newActor.Name = GetArgString(args, "name") ?? typeName;
+
+                if (args.ContainsKey("positionX") || args.ContainsKey("positionY") || args.ContainsKey("positionZ"))
+                {
+                    newActor.Position = new Vector3(
+                        GetArgFloat(args, "positionX"),
+                        GetArgFloat(args, "positionY"),
+                        GetArgFloat(args, "positionZ")
+                    );
+                }
+
+                if (args.ContainsKey("rotationX") || args.ContainsKey("rotationY") || args.ContainsKey("rotationZ"))
+                {
+                    newActor.Orientation = Quaternion.Euler(
+                        GetArgFloat(args, "rotationX"),
+                        GetArgFloat(args, "rotationY"),
+                        GetArgFloat(args, "rotationZ")
+                    );
+                }
+
+                if (newActor is StaticModel staticModel)
+                {
+                    var modelPath = GetArgString(args, "model");
+                    if (!string.IsNullOrEmpty(modelPath))
+                    {
+                        var model = FlaxEngine.Content.Load<Model>(modelPath);
+                        if (model != null)
+                            staticModel.Model = model;
+                        else
+                            Debug.LogWarning($"[McpServer] Model not found: {modelPath}");
+                    }
+                }
+
+                newActor.Parent = parent;
+
+                return BuildJsonObject(
+                    "ok", "true",
+                    "name", newActor.Name,
+                    "type", newActor.GetType().Name,
+                    "id", newActor.ID.ToString()
+                );
+            });
+        }
+
+        private string ToolDeleteActor(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                var actor = ResolveActor(args);
+                if (actor == null)
+                {
+                    var identifier = GetArgString(args, "name") ?? GetArgString(args, "id") ?? "unknown";
+                    return BuildJsonObject("error", $"Actor not found: {identifier}");
+                }
+
+                var actorName = actor.Name;
+                var actorId = actor.ID.ToString();
+                FlaxEngine.Object.Destroy(actor);
+
+                return BuildJsonObject(
+                    "ok", "true",
+                    "deleted", actorName,
+                    "id", actorId
+                );
+            });
+        }
+
+        private string ToolReparentActor(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                // Resolve the actor to reparent
+                Actor actor = null;
+                var actorId = GetArgString(args, "actorId");
+                var actorName = GetArgString(args, "actor");
+
+                if (!string.IsNullOrEmpty(actorId))
+                {
+                    if (Guid.TryParse(actorId, out var guid))
+                        actor = FlaxEngine.Object.Find<Actor>(ref guid);
+                }
+                else if (!string.IsNullOrEmpty(actorName))
+                {
+                    actor = FindActorByName(actorName);
+                }
+
+                if (actor == null)
+                    return BuildJsonObject("error", $"Actor not found: {actorName ?? actorId ?? "unknown"}");
+
+                // Resolve the new parent
+                Actor newParent = null;
+                var newParentId = GetArgString(args, "newParentId");
+                var newParentName = GetArgString(args, "newParent");
+
+                if (!string.IsNullOrEmpty(newParentId))
+                {
+                    if (Guid.TryParse(newParentId, out var guid))
+                        newParent = FlaxEngine.Object.Find<Actor>(ref guid);
+                }
+                else if (!string.IsNullOrEmpty(newParentName))
+                {
+                    newParent = FindActorByName(newParentName);
+                }
+
+                if (newParent == null)
+                    return BuildJsonObject("error", $"New parent not found: {newParentName ?? newParentId ?? "unknown"}");
+
+                actor.Parent = newParent;
+
+                return BuildJsonObject(
+                    "ok", "true",
+                    "actor", actor.Name,
+                    "newParent", newParent.Name
+                );
+            });
+        }
+
+        private string ToolCreateScene(Dictionary<string, object> args)
+        {
+            var sceneName = GetArgString(args, "name", "NewScene");
+
+            return InvokeOnMainThread(() =>
+            {
+                try
+                {
+                    var outputPath = GetArgString(args, "path") ?? $"Content/{sceneName}.scene";
+                    var absPath = Path.Combine(Globals.ProjectFolder, outputPath);
+                    var dir = Path.GetDirectoryName(absPath);
+                    if (dir != null)
+                        Directory.CreateDirectory(dir);
+
+                    if (FlaxEditor.Editor.CreateAsset("Scene", absPath))
+                        return BuildJsonObject("error", $"Failed to create scene at: {outputPath}");
+
+                    return BuildJsonObject(
+                        "created", "true",
+                        "name", sceneName,
+                        "path", outputPath
+                    );
+                }
+                catch (Exception ex)
+                {
+                    return BuildJsonObject("error", $"Failed to create scene: {ex.Message}");
+                }
+            });
+        }
+
+        private string ToolSaveScene(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                var scenes = Level.Scenes;
+                if (scenes == null || scenes.Length == 0)
+                    return BuildJsonObject("error", "No scenes loaded.");
+
+                Editor.Instance.Scene.SaveScenes();
+
+                return BuildJsonObject("ok", "true", "savedCount", scenes.Length.ToString());
+            });
+        }
+
+        private string ToolLoadScene(Dictionary<string, object> args)
+        {
+            var path = GetArgString(args, "path");
+            if (string.IsNullOrEmpty(path))
+                return BuildJsonObject("error", "Missing 'path' argument.");
+
+            return InvokeOnMainThread(() =>
+            {
+                try
+                {
+                    var asset = FlaxEngine.Content.Load<SceneAsset>(path);
+                    if (asset == null)
+                        return BuildJsonObject("error", $"Scene asset not found: {path}");
+
+                    Level.LoadScene(asset.ID);
+
+                    return BuildJsonObject(
+                        "ok", "true",
+                        "path", path,
+                        "status", "scene_load_requested"
+                    );
+                }
+                catch (Exception ex)
+                {
+                    return BuildJsonObject("error", $"Failed to load scene: {ex.Message}");
+                }
+            });
+        }
+
+        // ==================================================================
+        // TOOL HANDLERS: Assets & Content
+        // ==================================================================
+
+        private string ToolListAssets(Dictionary<string, object> args)
+        {
+            var path = GetArgString(args, "path", "Content");
+            var typeFilter = GetArgString(args, "type");
+
+            return InvokeOnMainThread(() =>
+            {
+                var item = Editor.Instance.ContentDatabase.Find(path);
+                if (item == null)
+                    return BuildJsonObject("error", $"Path not found: {path}");
+
+                var folder = item as ContentFolder;
+                if (folder == null)
+                    return BuildJsonObject("error", $"Path is not a folder: {path}");
+
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.AppendLine($"  \"path\": {JsonEscape(path)},");
+                sb.AppendLine("  \"items\": [");
+
+                var items = new List<string>();
+
+                foreach (var child in folder.Children)
+                {
+                    if (child is ContentFolder childFolder)
+                    {
+                        items.Add(BuildJsonObject(
+                            "name", childFolder.ShortName,
+                            "type", "Folder",
+                            "path", childFolder.Path
+                        ));
+                    }
+                    else
+                    {
+                        var ext = Path.GetExtension(child.FileName)?.TrimStart('.').ToLowerInvariant() ?? "";
+                        if (typeFilter != null && !string.Equals(ext, typeFilter, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        var idStr = "";
+                        if (child is AssetItem assetItem)
+                            idStr = assetItem.ID.ToString();
+
+                        items.Add(BuildJsonObject(
+                            "name", child.ShortName,
+                            "type", child.GetType().Name,
+                            "path", child.Path,
+                            "id", idStr
+                        ));
+                    }
+                }
+
+                for (int i = 0; i < items.Count; i++)
+                {
+                    sb.Append("    ");
+                    sb.Append(items[i]);
+                    if (i < items.Count - 1) sb.Append(",");
+                    sb.AppendLine();
+                }
+
+                sb.AppendLine("  ]");
+                sb.Append("}");
+                return sb.ToString();
+            });
+        }
+
+        private string ToolImportAssets(Dictionary<string, object> args)
+        {
+            var target = GetArgString(args, "target", "Content");
+            var skipDialog = GetArgBool(args, "skipDialog", true);
+
+            // Extract file list
+            var fileList = new List<string>();
+            if (args.TryGetValue("files", out var filesObj))
+            {
+                if (filesObj is List<object> objList)
+                {
+                    foreach (var f in objList)
+                    {
+                        if (f != null) fileList.Add(f.ToString());
+                    }
+                }
+                else if (filesObj is string[] strArr)
+                {
+                    fileList.AddRange(strArr);
+                }
+            }
+
+            if (fileList.Count == 0)
+                return BuildJsonObject("error", "Missing or empty 'files' argument.");
+
+            return InvokeOnMainThread(() =>
+            {
+                var folder = Editor.Instance.ContentDatabase.Find(target) as ContentFolder;
+                if (folder == null)
+                    return BuildJsonObject("error", $"Target folder not found: {target}");
+
+                int queued = 0;
+                foreach (var file in fileList)
+                {
+                    if (!File.Exists(file))
+                    {
+                        Debug.LogWarning($"[McpServer] Import file not found: {file}");
+                        continue;
+                    }
+
+                    Editor.Instance.ContentImporting.Import(file, folder, skipDialog);
+                    queued++;
+                }
+
+                return BuildJsonObject(
+                    "imported", queued.ToString(),
+                    "target", target
+                );
+            });
+        }
+
+        private string ToolFindContent(Dictionary<string, object> args)
+        {
+            var path = GetArgString(args, "path");
+            if (string.IsNullOrEmpty(path))
+                return BuildJsonObject("error", "Missing 'path' argument.");
+
+            return InvokeOnMainThread(() =>
+            {
+                var item = Editor.Instance.ContentDatabase.Find(path);
+                if (item == null)
+                    return BuildJsonObject("error", $"Content item not found: {path}");
+
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.AppendLine($"  \"name\": {JsonEscape(item.ShortName)},");
+                sb.AppendLine($"  \"type\": {JsonEscape(item.GetType().Name)},");
+                sb.AppendLine($"  \"path\": {JsonEscape(item.Path)},");
+                sb.AppendLine($"  \"isFolder\": {(item is ContentFolder ? "true" : "false")},");
+
+                if (item is AssetItem assetItem)
+                {
+                    sb.AppendLine($"  \"id\": {JsonEscape(assetItem.ID.ToString())},");
+                    sb.AppendLine($"  \"typeName\": {JsonEscape(assetItem.TypeName)}");
+                }
+                else
+                {
+                    sb.AppendLine($"  \"id\": \"\"");
+                }
+
+                sb.Append("}");
+                return sb.ToString();
+            });
+        }
+
+        private string ToolSearchContent(Dictionary<string, object> args)
+        {
+            var searchQuery = GetArgString(args, "query");
+            var typeFilter = GetArgString(args, "type");
+
+            if (string.IsNullOrEmpty(searchQuery) && string.IsNullOrEmpty(typeFilter))
+                return BuildJsonObject("error", "Provide 'query' and/or 'type' argument.");
+
+            return InvokeOnMainThread(() =>
+            {
+                var matches = new List<string>();
+                SearchContentItems(Editor.Instance.ContentDatabase.Game.Content.Folder, searchQuery, typeFilter, matches);
+
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.AppendLine($"  \"count\": {matches.Count},");
+                sb.AppendLine("  \"results\": [");
+
+                for (int i = 0; i < matches.Count; i++)
+                {
+                    sb.Append($"    {matches[i]}");
+                    if (i < matches.Count - 1) sb.Append(",");
+                    sb.AppendLine();
+                }
+
+                sb.AppendLine("  ]");
+                sb.Append("}");
+                return sb.ToString();
+            });
+        }
+
+        private string ToolGetContentInfo(Dictionary<string, object> args)
+        {
+            var path = GetArgString(args, "path");
+            if (string.IsNullOrEmpty(path))
+                return BuildJsonObject("error", "Missing 'path' argument.");
+
+            return InvokeOnMainThread(() =>
+            {
+                var item = Editor.Instance.ContentDatabase.Find(path);
+                if (item == null)
+                    return BuildJsonObject("error", $"Content item not found: {path}");
+
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.AppendLine($"  \"name\": {JsonEscape(item.ShortName)},");
+                sb.AppendLine($"  \"type\": {JsonEscape(item.GetType().Name)},");
+                sb.AppendLine($"  \"path\": {JsonEscape(item.Path)},");
+                sb.AppendLine($"  \"isFolder\": {(item is ContentFolder ? "true" : "false")},");
+
+                if (item is AssetItem assetItem)
+                {
+                    sb.AppendLine($"  \"id\": {JsonEscape(assetItem.ID.ToString())},");
+                    sb.AppendLine($"  \"typeName\": {JsonEscape(assetItem.TypeName)},");
+
+                    try
+                    {
+                        var fileInfo = new FileInfo(item.Path);
+                        if (fileInfo.Exists)
+                        {
+                            sb.AppendLine($"  \"sizeBytes\": {fileInfo.Length},");
+                            sb.AppendLine($"  \"lastModified\": {JsonEscape(fileInfo.LastWriteTimeUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))},");
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore file info errors
+                    }
+
+                    sb.AppendLine("  \"references\": []");
+                }
+                else
+                {
+                    sb.AppendLine($"  \"id\": \"\"");
+                }
+
+                sb.Append("}");
+                return sb.ToString();
+            });
+        }
+
+        private string ToolReimportContent(Dictionary<string, object> args)
+        {
+            var path = GetArgString(args, "path");
+            if (string.IsNullOrEmpty(path))
+                return BuildJsonObject("error", "Missing 'path' argument.");
+
+            return InvokeOnMainThread(() =>
+            {
+                var item = Editor.Instance.ContentDatabase.Find(path);
+                if (item == null)
+                    return BuildJsonObject("error", $"Asset not found: {path}");
+
+                if (item is BinaryAssetItem binaryItem)
+                {
+                    Editor.Instance.ContentImporting.Reimport(binaryItem);
+                    return BuildJsonObject(
+                        "ok", "true",
+                        "path", path,
+                        "status", "reimport_requested"
+                    );
+                }
+
+                return BuildJsonObject("error", $"Asset at {path} cannot be reimported.");
+            });
+        }
+
+        private string ToolGetContentTree(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                var contentRoot = Editor.Instance.ContentDatabase.Game.Content.Folder;
+                if (contentRoot == null)
+                    return BuildJsonObject("error", "Content database not available.");
+
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.Append("  \"tree\": ");
+                CollectContentTree(contentRoot, sb, 1);
+                sb.AppendLine();
+                sb.Append("}");
+                return sb.ToString();
+            });
+        }
+
+        // ==================================================================
+        // TOOL HANDLERS: Materials
+        // ==================================================================
+
+        private string ToolCreateMaterial(Dictionary<string, object> args)
+        {
+            var name = GetArgString(args, "name");
+            var outputPath = GetArgString(args, "outputPath");
+
+            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(outputPath))
+                return BuildJsonObject("error", "Missing 'name' or 'outputPath' argument.");
+
+            return InvokeOnMainThread(() =>
+            {
+                var absPath = Path.Combine(Globals.ProjectFolder, outputPath);
+                var dir = Path.GetDirectoryName(absPath);
+                if (dir != null)
+                    Directory.CreateDirectory(dir);
+
+                if (FlaxEditor.Editor.CreateAsset("Material", absPath))
+                    return BuildJsonObject("error", $"Failed to create material at: {outputPath}");
+
+                return BuildJsonObject(
+                    "created", "true",
+                    "name", name,
+                    "path", outputPath
+                );
+            });
+        }
+
+        private string ToolCreateMaterialInstance(Dictionary<string, object> args)
+        {
+            var name = GetArgString(args, "name");
+            var outputPath = GetArgString(args, "outputPath");
+
+            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(outputPath))
+                return BuildJsonObject("error", "Missing 'name' or 'outputPath' argument.");
+
+            return InvokeOnMainThread(() =>
+            {
+                var absPath = Path.Combine(Globals.ProjectFolder, outputPath);
+                var dir = Path.GetDirectoryName(absPath);
+                if (dir != null)
+                    Directory.CreateDirectory(dir);
+
+                if (FlaxEditor.Editor.CreateAsset("MaterialInstance", absPath))
+                    return BuildJsonObject("error", $"Failed to create material instance at: {outputPath}");
+
+                var instance = FlaxEngine.Content.Load<MaterialInstance>(outputPath);
+                if (instance == null)
+                    return BuildJsonObject("error", $"Failed to load created material instance: {outputPath}");
+
+                var baseMaterialPath = GetArgString(args, "baseMaterial");
+                if (!string.IsNullOrEmpty(baseMaterialPath))
+                {
+                    var baseMat = FlaxEngine.Content.Load<MaterialBase>(baseMaterialPath);
+                    if (baseMat != null)
+                        instance.BaseMaterial = baseMat;
+                    else
+                        Debug.LogWarning($"[McpServer] Base material not found: {baseMaterialPath}");
+                }
+
+                if (args.TryGetValue("parameters", out var paramsObj) && paramsObj is Dictionary<string, object> paramDict)
+                {
+                    foreach (var kvp in paramDict)
+                    {
+                        try
+                        {
+                            SetMaterialParameter(instance, kvp.Key, kvp.Value);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogWarning($"[McpServer] Failed to set parameter '{kvp.Key}': {ex.Message}");
+                        }
+                    }
+                }
+
+                instance.Save();
+
+                return BuildJsonObject(
+                    "created", "true",
+                    "name", name,
+                    "path", outputPath
+                );
+            });
+        }
+
+        // ==================================================================
+        // TOOL HANDLERS: Physics
+        // ==================================================================
+
+        private string ToolPhysicsRaycast(Dictionary<string, object> args)
+        {
+            float originX = GetArgFloat(args, "originX");
+            float originY = GetArgFloat(args, "originY");
+            float originZ = GetArgFloat(args, "originZ");
+            float dirX = GetArgFloat(args, "directionX");
+            float dirY = GetArgFloat(args, "directionY", -1f);
+            float dirZ = GetArgFloat(args, "directionZ");
+            float maxDist = GetArgFloat(args, "maxDistance", 1000f);
+
+            return InvokeOnMainThread(() =>
             {
                 var origin = new Vector3(originX, originY, originZ);
                 var direction = new Vector3(dirX, dirY, dirZ);
@@ -258,22 +1557,16 @@ namespace FlaxMCP
 
                 return BuildJsonObject("hit", "false");
             });
-
-            WriteJson(response, 200, result);
         }
 
-        // ------------------------------------------------------------------
-        // GET /physics/overlap?x=0&y=0&z=0&radius=5
-        // ------------------------------------------------------------------
-
-        private void HandlePhysicsOverlap(HttpListenerResponse response, NameValueCollection query)
+        private string ToolPhysicsOverlap(Dictionary<string, object> args)
         {
-            float x = ParseFloat(query["x"], 0f);
-            float y = ParseFloat(query["y"], 0f);
-            float z = ParseFloat(query["z"], 0f);
-            float radius = ParseFloat(query["radius"], 5f);
+            float x = GetArgFloat(args, "x");
+            float y = GetArgFloat(args, "y");
+            float z = GetArgFloat(args, "z");
+            float radius = GetArgFloat(args, "radius", 5f);
 
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 var center = new Vector3(x, y, z);
                 Collider[] results;
@@ -291,7 +1584,6 @@ namespace FlaxMCP
                 }
                 else
                 {
-                    // Deduplicate by top-level actor
                     var seen = new HashSet<Guid>();
                     var actors = new List<Actor>();
                     foreach (var collider in results)
@@ -314,8 +1606,7 @@ namespace FlaxMCP
                         sb.AppendLine($"      \"id\": {JsonEscape(a.ID.ToString())},");
                         sb.AppendLine($"      \"position\": {{ \"X\": {pos.X}, \"Y\": {pos.Y}, \"Z\": {pos.Z} }}");
                         sb.Append("    }");
-                        if (i < actors.Count - 1)
-                            sb.Append(",");
+                        if (i < actors.Count - 1) sb.Append(",");
                         sb.AppendLine();
                     }
 
@@ -325,18 +1616,11 @@ namespace FlaxMCP
                 sb.Append("}");
                 return sb.ToString();
             });
-
-            WriteJson(response, 200, result);
         }
 
-        // ------------------------------------------------------------------
-        // GET  /physics/settings  - get current physics settings
-        // POST /physics/settings  - set physics settings
-        // ------------------------------------------------------------------
-
-        private void HandlePhysicsSettingsGet(HttpListenerResponse response)
+        private string ToolGetPhysicsSettings(Dictionary<string, object> args)
         {
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 var gravity = Physics.Gravity;
                 var sb = new StringBuilder();
@@ -347,186 +1631,145 @@ namespace FlaxMCP
                 sb.Append("}");
                 return sb.ToString();
             });
-
-            WriteJson(response, 200, result);
         }
 
-        private void HandlePhysicsSettingsSet(HttpListenerContext context, HttpListenerResponse response)
+        private string ToolSetPhysicsSettings(Dictionary<string, object> args)
         {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<PhysicsSettingsRequest>(body);
-
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
-                if (data == null)
-                    return BuildJsonObject("error", "Invalid request body.");
-
-                if (data.GravityX.HasValue || data.GravityY.HasValue || data.GravityZ.HasValue)
+                if (args.ContainsKey("gravityX") || args.ContainsKey("gravityY") || args.ContainsKey("gravityZ"))
                 {
                     var g = Physics.Gravity;
                     Physics.Gravity = new Float3(
-                        data.GravityX ?? (float)g.X,
-                        data.GravityY ?? (float)g.Y,
-                        data.GravityZ ?? (float)g.Z
+                        args.ContainsKey("gravityX") ? GetArgFloat(args, "gravityX") : (float)g.X,
+                        args.ContainsKey("gravityY") ? GetArgFloat(args, "gravityY") : (float)g.Y,
+                        args.ContainsKey("gravityZ") ? GetArgFloat(args, "gravityZ") : (float)g.Z
                     );
                 }
 
                 return BuildJsonObject("ok", "true", "status", "physics settings updated");
             });
-
-            var statusCode = result.Contains("\"error\"") ? 400 : 200;
-            WriteJson(response, statusCode, result);
         }
 
         // ==================================================================
-        // ANIMATION
+        // TOOL HANDLERS: Animation
         // ==================================================================
 
-        // ------------------------------------------------------------------
-        // GET /animation/list?actor=ActorName
-        // ------------------------------------------------------------------
-
-        private void HandleAnimationList(HttpListenerResponse response, NameValueCollection query)
+        private string ToolListAnimations(Dictionary<string, object> args)
         {
-            var actorName = query["actor"];
-            if (string.IsNullOrEmpty(actorName))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'actor' query parameter."));
-                return;
-            }
+            var actorName = GetArgString(args, "actor");
 
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
-                var actor = FindActorByName(actorName);
-                if (actor == null)
-                    return BuildJsonObject("error", $"Actor not found: {actorName}");
+                var scenes = Level.Scenes;
+                if (scenes == null || scenes.Length == 0)
+                    return BuildJsonObject("error", "No scenes loaded.");
 
-                var animatedModel = actor as AnimatedModel;
-                if (animatedModel == null)
+                var animatedModels = new List<AnimatedModel>();
+
+                if (!string.IsNullOrEmpty(actorName))
                 {
-                    // Check children for an AnimatedModel
-                    animatedModel = actor.GetChild<AnimatedModel>();
-                }
+                    var actor = FindActorByName(actorName);
+                    if (actor == null)
+                        return BuildJsonObject("error", $"Actor not found: {actorName}");
 
-                if (animatedModel == null)
-                    return BuildJsonObject("error", $"No AnimatedModel found on actor: {actorName}");
+                    var am = actor as AnimatedModel ?? actor.GetChild<AnimatedModel>();
+                    if (am != null)
+                        animatedModels.Add(am);
+                    else
+                        return BuildJsonObject("error", $"No AnimatedModel found on actor: {actorName}");
+                }
+                else
+                {
+                    foreach (var scene in scenes)
+                        CollectActorsOfType(scene, animatedModels);
+                }
 
                 var sb = new StringBuilder();
                 sb.AppendLine("{");
-                sb.AppendLine($"  \"actor\": {JsonEscape(actor.Name)},");
+                sb.AppendLine($"  \"count\": {animatedModels.Count},");
+                sb.AppendLine("  \"animatedModels\": [");
 
-                // Skinned model info
-                var skinnedModel = animatedModel.SkinnedModel;
-                if (skinnedModel != null)
+                for (int i = 0; i < animatedModels.Count; i++)
                 {
-                    sb.AppendLine($"  \"skinnedModel\": {JsonEscape(skinnedModel.Path)},");
-                }
-                else
-                {
-                    sb.AppendLine("  \"skinnedModel\": null,");
-                }
+                    var am = animatedModels[i];
+                    sb.AppendLine("    {");
+                    sb.AppendLine($"      \"name\": {JsonEscape(am.Name)},");
+                    sb.AppendLine($"      \"id\": {JsonEscape(am.ID.ToString())},");
+                    sb.AppendLine($"      \"skinnedModel\": {JsonEscape(am.SkinnedModel?.Path ?? "none")},");
+                    sb.AppendLine($"      \"animationGraph\": {JsonEscape(am.AnimationGraph?.Path ?? "none")},");
 
-                // Animation graph
-                var animGraph = animatedModel.AnimationGraph;
-                if (animGraph != null)
-                {
-                    sb.AppendLine($"  \"animationGraph\": {JsonEscape(animGraph.Path)},");
-                }
-                else
-                {
-                    sb.AppendLine("  \"animationGraph\": null,");
-                }
-
-                // List parameter names from the anim graph
-                sb.AppendLine("  \"parameters\": [");
-                var parameters = animatedModel.Parameters;
-                if (parameters != null)
-                {
-                    for (int i = 0; i < parameters.Length; i++)
+                    sb.AppendLine("      \"parameters\": [");
+                    var parameters = am.Parameters;
+                    if (parameters != null)
                     {
-                        var p = parameters[i];
-                        sb.AppendLine("    {");
-                        sb.AppendLine($"      \"name\": {JsonEscape(p.Name)},");
-                        sb.AppendLine($"      \"type\": {JsonEscape(p.Type.ToString())},");
-                        sb.AppendLine($"      \"value\": {JsonEscape(p.Value?.ToString() ?? "null")}");
-                        sb.Append("    }");
-                        if (i < parameters.Length - 1)
-                            sb.Append(",");
-                        sb.AppendLine();
+                        for (int p = 0; p < parameters.Length; p++)
+                        {
+                            var param = parameters[p];
+                            sb.AppendLine("        {");
+                            sb.AppendLine($"          \"name\": {JsonEscape(param.Name)},");
+                            sb.AppendLine($"          \"type\": {JsonEscape(param.Type.ToString())},");
+                            sb.AppendLine($"          \"value\": {JsonEscape(param.Value?.ToString() ?? "null")}");
+                            sb.Append("        }");
+                            if (p < parameters.Length - 1) sb.Append(",");
+                            sb.AppendLine();
+                        }
                     }
+                    sb.AppendLine("      ]");
+
+                    sb.Append("    }");
+                    if (i < animatedModels.Count - 1) sb.Append(",");
+                    sb.AppendLine();
                 }
 
                 sb.AppendLine("  ]");
                 sb.Append("}");
                 return sb.ToString();
             });
-
-            var statusCode = result.Contains("\"error\"") ? 404 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // POST /animation/play
-        // ------------------------------------------------------------------
-
-        private void HandleAnimationPlay(HttpListenerContext context, HttpListenerResponse response)
+        private string ToolPlayAnimation(Dictionary<string, object> args)
         {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<AnimationPlayRequest>(body);
+            var actorName = GetArgString(args, "actor");
+            if (string.IsNullOrEmpty(actorName))
+                return BuildJsonObject("error", "Missing 'actor' argument.");
 
-            if (data == null || string.IsNullOrEmpty(data.Actor))
+            return InvokeOnMainThread(() =>
             {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'actor' in request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                var actor = FindActorByName(data.Actor);
+                var actor = FindActorByName(actorName);
                 if (actor == null)
-                    return BuildJsonObject("error", $"Actor not found: {data.Actor}");
+                    return BuildJsonObject("error", $"Actor not found: {actorName}");
 
                 var animatedModel = actor as AnimatedModel ?? actor.GetChild<AnimatedModel>();
                 if (animatedModel == null)
-                    return BuildJsonObject("error", $"No AnimatedModel found on actor: {data.Actor}");
+                    return BuildJsonObject("error", $"No AnimatedModel found on actor: {actorName}");
 
-                // Set playback speed if specified
-                if (data.Speed.HasValue)
-                    animatedModel.UpdateSpeed = data.Speed.Value;
+                if (args.ContainsKey("speed"))
+                    animatedModel.UpdateSpeed = GetArgFloat(args, "speed", 1f);
 
-                // If a parameter name is provided, try to set it (e.g., a trigger)
-                if (!string.IsNullOrEmpty(data.Parameter) && data.ParameterValue != null)
+                var paramName = GetArgString(args, "parameter");
+                if (!string.IsNullOrEmpty(paramName) && args.TryGetValue("parameterValue", out var paramVal))
                 {
-                    var param = animatedModel.GetParameter(data.Parameter);
+                    var param = animatedModel.GetParameter(paramName);
                     if (param != null)
-                        param.Value = data.ParameterValue;
+                        param.Value = paramVal;
                 }
 
                 return BuildJsonObject(
                     "ok", "true",
                     "actor", actor.Name,
-                    "speed", (data.Speed ?? animatedModel.UpdateSpeed).ToString("F2")
+                    "speed", animatedModel.UpdateSpeed.ToString("F2")
                 );
             });
-
-            var statusCode = result.Contains("\"error\"") ? 400 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // GET /animation/state?actor=ActorName
-        // ------------------------------------------------------------------
-
-        private void HandleAnimationState(HttpListenerResponse response, NameValueCollection query)
+        private string ToolGetAnimationState(Dictionary<string, object> args)
         {
-            var actorName = query["actor"];
+            var actorName = GetArgString(args, "actor");
             if (string.IsNullOrEmpty(actorName))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'actor' query parameter."));
-                return;
-            }
+                return BuildJsonObject("error", "Missing 'actor' argument.");
 
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 var actor = FindActorByName(actorName);
                 if (actor == null)
@@ -543,7 +1786,6 @@ namespace FlaxMCP
                 sb.AppendLine($"  \"speed\": {animatedModel.UpdateSpeed},");
                 sb.AppendLine($"  \"updateMode\": {JsonEscape(animatedModel.UpdateMode.ToString())},");
 
-                // Current parameter values
                 sb.AppendLine("  \"parameters\": [");
                 var parameters = animatedModel.Parameters;
                 if (parameters != null)
@@ -555,8 +1797,7 @@ namespace FlaxMCP
                         sb.AppendLine($"      \"name\": {JsonEscape(p.Name)},");
                         sb.AppendLine($"      \"value\": {JsonEscape(p.Value?.ToString() ?? "null")}");
                         sb.Append("    }");
-                        if (i < parameters.Length - 1)
-                            sb.Append(",");
+                        if (i < parameters.Length - 1) sb.Append(",");
                         sb.AppendLine();
                     }
                 }
@@ -565,22 +1806,15 @@ namespace FlaxMCP
                 sb.Append("}");
                 return sb.ToString();
             });
-
-            var statusCode = result.Contains("\"error\"") ? 404 : 200;
-            WriteJson(response, statusCode, result);
         }
 
         // ==================================================================
-        // TERRAIN
+        // TOOL HANDLERS: Terrain
         // ==================================================================
 
-        // ------------------------------------------------------------------
-        // GET /terrain/info
-        // ------------------------------------------------------------------
-
-        private void HandleTerrainInfo(HttpListenerResponse response)
+        private string ToolGetTerrainInfo(Dictionary<string, object> args)
         {
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 var terrains = new List<Terrain>();
                 var scenes = Level.Scenes;
@@ -606,20 +1840,15 @@ namespace FlaxMCP
                     sb.AppendLine($"      \"name\": {JsonEscape(terrain.Name)},");
                     sb.AppendLine($"      \"id\": {JsonEscape(terrain.ID.ToString())},");
                     sb.AppendLine($"      \"position\": {{ \"X\": {pos.X}, \"Y\": {pos.Y}, \"Z\": {pos.Z} }},");
-
-                    // Terrain patch info
-                    var patchCount = terrain.PatchesCount;
-                    sb.AppendLine($"      \"patchCount\": {patchCount},");
+                    sb.AppendLine($"      \"patchCount\": {terrain.PatchesCount},");
                     sb.AppendLine($"      \"chunkSize\": {terrain.ChunkSize},");
 
-                    // Bounding box
                     var box = terrain.Box;
                     sb.AppendLine($"      \"boundsMin\": {{ \"X\": {box.Minimum.X}, \"Y\": {box.Minimum.Y}, \"Z\": {box.Minimum.Z} }},");
                     sb.AppendLine($"      \"boundsMax\": {{ \"X\": {box.Maximum.X}, \"Y\": {box.Maximum.Y}, \"Z\": {box.Maximum.Z} }}");
 
                     sb.Append("    }");
-                    if (i < terrains.Count - 1)
-                        sb.Append(",");
+                    if (i < terrains.Count - 1) sb.Append(",");
                     sb.AppendLine();
                 }
 
@@ -627,27 +1856,14 @@ namespace FlaxMCP
                 sb.Append("}");
                 return sb.ToString();
             });
-
-            var statusCode = result.Contains("\"error\"") ? 404 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // POST /terrain/sculpt
-        // ------------------------------------------------------------------
-
-        private void HandleTerrainSculpt(HttpListenerContext context, HttpListenerResponse response)
+        private string ToolTerrainSculpt(Dictionary<string, object> args)
         {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<TerrainSculptRequest>(body);
+            float xPos = GetArgFloat(args, "x");
+            float zPos = GetArgFloat(args, "z");
 
-            if (data == null)
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Invalid request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 var terrains = new List<Terrain>();
                 var scenes = Level.Scenes;
@@ -660,53 +1876,41 @@ namespace FlaxMCP
                 if (terrains.Count == 0)
                     return BuildJsonObject("error", "No Terrain actors found in the scene.");
 
-                // Use first terrain or find by name
                 Terrain terrain;
-                if (!string.IsNullOrEmpty(data.TerrainName))
+                var terrainName = GetArgString(args, "terrainName");
+                if (!string.IsNullOrEmpty(terrainName))
                 {
-                    terrain = terrains.Find(t => string.Equals(t.Name, data.TerrainName, StringComparison.OrdinalIgnoreCase));
+                    terrain = terrains.Find(t => string.Equals(t.Name, terrainName, StringComparison.OrdinalIgnoreCase));
                     if (terrain == null)
-                        return BuildJsonObject("error", $"Terrain not found: {data.TerrainName}");
+                        return BuildJsonObject("error", $"Terrain not found: {terrainName}");
                 }
                 else
                 {
                     terrain = terrains[0];
                 }
 
-                // Terrain sculpting requires the editor's tools infrastructure.
-                // We raise a height modification by sampling and writing patch data.
-                // For safety, we perform a raycast down at the position to confirm
-                // the terrain is present.
-                var worldPos = new Vector3(data.X, 10000f, data.Z);
+                var worldPos = new Vector3(xPos, 10000f, zPos);
                 RayCastHit hit;
                 if (!Physics.RayCast(worldPos, Vector3.Down, out hit, 20000f))
-                    return BuildJsonObject("error", $"No terrain surface found at X={data.X}, Z={data.Z}");
+                    return BuildJsonObject("error", $"No terrain surface found at X={xPos}, Z={zPos}");
 
                 return BuildJsonObject(
                     "ok", "true",
                     "terrain", terrain.Name,
                     "note", "Terrain sculpt operations require the Editor sculpt tool. Use the editor viewport or terrain tool API for direct heightmap edits.",
-                    "position", $"X={data.X}, Z={data.Z}",
+                    "position", $"X={xPos}, Z={zPos}",
                     "surfaceY", hit.Point.Y.ToString("F2")
                 );
             });
-
-            var statusCode = result.Contains("\"error\"") ? 400 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // GET /terrain/height?x=100&z=100
-        // ------------------------------------------------------------------
-
-        private void HandleTerrainHeight(HttpListenerResponse response, NameValueCollection query)
+        private string ToolGetTerrainHeight(Dictionary<string, object> args)
         {
-            float x = ParseFloat(query["x"], 0f);
-            float z = ParseFloat(query["z"], 0f);
+            float x = GetArgFloat(args, "x");
+            float z = GetArgFloat(args, "z");
 
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
-                // Cast a ray downward from high up to find terrain surface height
                 var origin = new Vector3(x, 100000f, z);
                 RayCastHit hit;
                 if (Physics.RayCast(origin, Vector3.Down, out hit, 200000f))
@@ -723,26 +1927,19 @@ namespace FlaxMCP
 
                 return BuildJsonObject("error", $"No surface found at X={x}, Z={z}");
             });
-
-            var statusCode = result.Contains("\"error\"") ? 404 : 200;
-            WriteJson(response, statusCode, result);
         }
 
         // ==================================================================
-        // NAVIGATION / NAVMESH
+        // TOOL HANDLERS: Navigation
         // ==================================================================
 
-        // ------------------------------------------------------------------
-        // POST /navigation/build
-        // ------------------------------------------------------------------
-
-        private void HandleNavigationBuild(HttpListenerResponse response)
+        private string ToolBuildNavmesh(Dictionary<string, object> args)
         {
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 try
                 {
-                    Navigation.BuildNavMesh(Level.Scenes[0], new BoundingBox(new Vector3(-100000), new Vector3(100000)));
+                    Navigation.BuildNavMesh(new BoundingBox(new Vector3(-100000), new Vector3(100000)), Level.Scenes[0]);
                     return BuildJsonObject("ok", "true", "status", "navmesh_build_requested");
                 }
                 catch (Exception ex)
@@ -750,28 +1947,21 @@ namespace FlaxMCP
                     return BuildJsonObject("error", $"Failed to build navmesh: {ex.Message}");
                 }
             });
-
-            var statusCode = result.Contains("\"error\"") ? 500 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // GET /navigation/query?fromX=0&fromZ=0&toX=100&toZ=100
-        // ------------------------------------------------------------------
-
-        private void HandleNavigationQuery(HttpListenerResponse response, NameValueCollection query)
+        private string ToolQueryNavpath(Dictionary<string, object> args)
         {
-            float fromX = ParseFloat(query["fromX"], 0f);
-            float fromY = ParseFloat(query["fromY"], 0f);
-            float fromZ = ParseFloat(query["fromZ"], 0f);
-            float toX = ParseFloat(query["toX"], 0f);
-            float toY = ParseFloat(query["toY"], 0f);
-            float toZ = ParseFloat(query["toZ"], 0f);
+            float startX = GetArgFloat(args, "startX");
+            float startY = GetArgFloat(args, "startY");
+            float startZ = GetArgFloat(args, "startZ");
+            float endX = GetArgFloat(args, "endX");
+            float endY = GetArgFloat(args, "endY");
+            float endZ = GetArgFloat(args, "endZ");
 
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
-                var start = new Vector3(fromX, fromY, fromZ);
-                var end = new Vector3(toX, toY, toZ);
+                var start = new Vector3(startX, startY, startZ);
+                var end = new Vector3(endX, endY, endZ);
 
                 Vector3[] pathPoints;
                 if (Navigation.FindPath(start, end, out pathPoints))
@@ -786,8 +1976,7 @@ namespace FlaxMCP
                     {
                         var pt = pathPoints[i];
                         sb.Append($"    {{ \"X\": {pt.X}, \"Y\": {pt.Y}, \"Z\": {pt.Z} }}");
-                        if (i < pathPoints.Length - 1)
-                            sb.Append(",");
+                        if (i < pathPoints.Length - 1) sb.Append(",");
                         sb.AppendLine();
                     }
 
@@ -798,23 +1987,16 @@ namespace FlaxMCP
 
                 return BuildJsonObject("found", "false");
             });
-
-            WriteJson(response, 200, result);
         }
 
-        // ------------------------------------------------------------------
-        // GET /navigation/info
-        // ------------------------------------------------------------------
-
-        private void HandleNavigationInfo(HttpListenerResponse response)
+        private string ToolGetNavigationInfo(Dictionary<string, object> args)
         {
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 var scenes = Level.Scenes;
                 if (scenes == null || scenes.Length == 0)
                     return BuildJsonObject("error", "No scenes loaded.");
 
-                // Find NavMesh-related actors
                 var navVolumes = new List<Actor>();
                 foreach (var scene in scenes)
                     CollectActorsOfTypeName(scene, "NavMeshBoundsVolume", navVolumes);
@@ -833,8 +2015,7 @@ namespace FlaxMCP
                     sb.AppendLine($"      \"id\": {JsonEscape(vol.ID.ToString())},");
                     sb.AppendLine($"      \"position\": {{ \"X\": {pos.X}, \"Y\": {pos.Y}, \"Z\": {pos.Z} }}");
                     sb.Append("    }");
-                    if (i < navVolumes.Count - 1)
-                        sb.Append(",");
+                    if (i < navVolumes.Count - 1) sb.Append(",");
                     sb.AppendLine();
                 }
 
@@ -842,42 +2023,31 @@ namespace FlaxMCP
                 sb.Append("}");
                 return sb.ToString();
             });
-
-            WriteJson(response, 200, result);
         }
 
         // ==================================================================
-        // RENDERING
+        // TOOL HANDLERS: Rendering
         // ==================================================================
 
-        // ------------------------------------------------------------------
-        // POST /rendering/screenshot
-        // ------------------------------------------------------------------
-
-        private void HandleRenderingScreenshot(HttpListenerContext context, HttpListenerResponse response)
+        private string ToolTakeScreenshot(Dictionary<string, object> args)
         {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<ScreenshotRequest>(body);
+            var outputPath = GetArgString(args, "outputPath");
+            if (string.IsNullOrEmpty(outputPath))
+                return BuildJsonObject("error", "Missing 'outputPath' argument.");
 
-            if (data == null || string.IsNullOrEmpty(data.OutputPath))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'outputPath' in request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 try
                 {
-                    var dir = Path.GetDirectoryName(data.OutputPath);
+                    var dir = Path.GetDirectoryName(outputPath);
                     if (dir != null)
                         Directory.CreateDirectory(dir);
 
-                    Screenshot.Capture(data.OutputPath);
+                    Screenshot.Capture(outputPath);
 
                     return BuildJsonObject(
                         "ok", "true",
-                        "outputPath", data.OutputPath
+                        "outputPath", outputPath
                     );
                 }
                 catch (Exception ex)
@@ -885,24 +2055,15 @@ namespace FlaxMCP
                     return BuildJsonObject("error", $"Screenshot failed: {ex.Message}");
                 }
             });
-
-            var statusCode = result.Contains("\"error\"") ? 500 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // GET  /rendering/settings
-        // POST /rendering/settings
-        // ------------------------------------------------------------------
-
-        private void HandleRenderingSettingsGet(HttpListenerResponse response)
+        private string ToolGetRenderingSettings(Dictionary<string, object> args)
         {
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 var sb = new StringBuilder();
                 sb.AppendLine("{");
 
-                // Post-process settings from the scene
                 var postFx = new List<PostFxVolume>();
                 var scenes = Level.Scenes;
                 if (scenes != null)
@@ -923,8 +2084,7 @@ namespace FlaxMCP
                     sb.AppendLine($"      \"priority\": {vol.Priority},");
                     sb.AppendLine($"      \"isBounded\": {(vol.IsBounded ? "true" : "false")}");
                     sb.Append("    }");
-                    if (i < postFx.Count - 1)
-                        sb.Append(",");
+                    if (i < postFx.Count - 1) sb.Append(",");
                     sb.AppendLine();
                 }
 
@@ -932,70 +2092,47 @@ namespace FlaxMCP
                 sb.Append("}");
                 return sb.ToString();
             });
-
-            WriteJson(response, 200, result);
         }
 
-        private void HandleRenderingSettingsSet(HttpListenerContext context, HttpListenerResponse response)
+        private string ToolSetRenderingSettings(Dictionary<string, object> args)
         {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<RenderingSettingsRequest>(body);
-
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
-                if (data == null)
-                    return BuildJsonObject("error", "Invalid request body.");
-
                 // Graphics.HalfResolution is not available in Flax 1.11.
                 // Additional rendering settings can be added here as needed.
-
                 return BuildJsonObject("ok", "true", "status", "rendering settings updated");
             });
-
-            var statusCode = result.Contains("\"error\"") ? 400 : 200;
-            WriteJson(response, statusCode, result);
         }
 
         // ==================================================================
-        // AUDIO
+        // TOOL HANDLERS: Audio
         // ==================================================================
 
-        // ------------------------------------------------------------------
-        // POST /audio/play
-        // ------------------------------------------------------------------
-
-        private void HandleAudioPlay(HttpListenerContext context, HttpListenerResponse response)
+        private string ToolPlayAudio(Dictionary<string, object> args)
         {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<AudioPlayRequest>(body);
+            var clipPath = GetArgString(args, "clip");
+            if (string.IsNullOrEmpty(clipPath))
+                return BuildJsonObject("error", "Missing 'clip' argument.");
 
-            if (data == null || string.IsNullOrEmpty(data.Clip))
+            return InvokeOnMainThread(() =>
             {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'clip' in request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                var clip = FlaxEngine.Content.Load<AudioClip>(data.Clip);
+                var clip = FlaxEngine.Content.Load<AudioClip>(clipPath);
                 if (clip == null)
-                    return BuildJsonObject("error", $"Audio clip not found: {data.Clip}");
+                    return BuildJsonObject("error", $"Audio clip not found: {clipPath}");
 
-                // Create a temporary audio source at the specified position
                 var audioSource = new AudioSource();
                 audioSource.Clip = clip;
-                audioSource.IsLooping = data.Loop;
+                audioSource.IsLooping = GetArgBool(args, "loop");
 
-                if (data.PositionX.HasValue || data.PositionY.HasValue || data.PositionZ.HasValue)
+                if (args.ContainsKey("positionX") || args.ContainsKey("positionY") || args.ContainsKey("positionZ"))
                 {
                     audioSource.Position = new Vector3(
-                        data.PositionX ?? 0f,
-                        data.PositionY ?? 0f,
-                        data.PositionZ ?? 0f
+                        GetArgFloat(args, "positionX"),
+                        GetArgFloat(args, "positionY"),
+                        GetArgFloat(args, "positionZ")
                     );
                 }
 
-                // Parent to first scene so it persists
                 var scenes = Level.Scenes;
                 if (scenes != null && scenes.Length > 0)
                 {
@@ -1007,22 +2144,15 @@ namespace FlaxMCP
 
                 return BuildJsonObject(
                     "ok", "true",
-                    "clip", data.Clip,
+                    "clip", clipPath,
                     "actorId", audioSource.ID.ToString()
                 );
             });
-
-            var statusCode = result.Contains("\"error\"") ? 400 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // GET /audio/sources
-        // ------------------------------------------------------------------
-
-        private void HandleAudioSources(HttpListenerResponse response)
+        private string ToolListAudioSources(Dictionary<string, object> args)
         {
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 var sources = new List<AudioSource>();
                 var scenes = Level.Scenes;
@@ -1050,8 +2180,7 @@ namespace FlaxMCP
                     sb.AppendLine($"      \"volume\": {src.Volume},");
                     sb.AppendLine($"      \"position\": {{ \"X\": {pos.X}, \"Y\": {pos.Y}, \"Z\": {pos.Z} }}");
                     sb.Append("    }");
-                    if (i < sources.Count - 1)
-                        sb.Append(",");
+                    if (i < sources.Count - 1) sb.Append(",");
                     sb.AppendLine();
                 }
 
@@ -1059,92 +2188,75 @@ namespace FlaxMCP
                 sb.Append("}");
                 return sb.ToString();
             });
-
-            WriteJson(response, 200, result);
         }
 
         // ==================================================================
-        // PREFABS
+        // TOOL HANDLERS: Prefabs
         // ==================================================================
 
-        // ------------------------------------------------------------------
-        // POST /prefabs/spawn
-        // ------------------------------------------------------------------
-
-        private void HandlePrefabSpawn(HttpListenerContext context, HttpListenerResponse response)
+        private string ToolSpawnPrefab(Dictionary<string, object> args)
         {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<PrefabSpawnRequest>(body);
+            var prefabPath = GetArgString(args, "prefab");
+            if (string.IsNullOrEmpty(prefabPath))
+                return BuildJsonObject("error", "Missing 'prefab' argument.");
 
-            if (data == null || string.IsNullOrEmpty(data.Prefab))
+            return InvokeOnMainThread(() =>
             {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'prefab' in request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                var prefab = FlaxEngine.Content.Load<Prefab>(data.Prefab);
+                var prefab = FlaxEngine.Content.Load<Prefab>(prefabPath);
                 if (prefab == null)
-                    return BuildJsonObject("error", $"Prefab not found: {data.Prefab}");
+                    return BuildJsonObject("error", $"Prefab not found: {prefabPath}");
 
                 var scenes = Level.Scenes;
                 if (scenes == null || scenes.Length == 0)
                     return BuildJsonObject("error", "No scenes loaded.");
 
                 Actor parent = scenes[0];
-                if (!string.IsNullOrEmpty(data.Parent))
+                var parentName = GetArgString(args, "parent");
+                if (!string.IsNullOrEmpty(parentName))
                 {
-                    var found = FindActorByName(data.Parent);
+                    var found = FindActorByName(parentName);
                     if (found != null)
                         parent = found;
                 }
 
                 var instance = PrefabManager.SpawnPrefab(prefab, parent);
                 if (instance == null)
-                    return BuildJsonObject("error", $"Failed to spawn prefab: {data.Prefab}");
+                    return BuildJsonObject("error", $"Failed to spawn prefab: {prefabPath}");
 
-                // Apply transform
-                if (data.PositionX.HasValue || data.PositionY.HasValue || data.PositionZ.HasValue)
+                if (args.ContainsKey("positionX") || args.ContainsKey("positionY") || args.ContainsKey("positionZ"))
                 {
                     instance.Position = new Vector3(
-                        data.PositionX ?? 0f,
-                        data.PositionY ?? 0f,
-                        data.PositionZ ?? 0f
+                        GetArgFloat(args, "positionX"),
+                        GetArgFloat(args, "positionY"),
+                        GetArgFloat(args, "positionZ")
                     );
                 }
 
-                if (data.RotationY.HasValue)
+                if (args.ContainsKey("rotationX") || args.ContainsKey("rotationY") || args.ContainsKey("rotationZ"))
                 {
                     instance.Orientation = Quaternion.Euler(
-                        data.RotationX ?? 0f,
-                        data.RotationY ?? 0f,
-                        data.RotationZ ?? 0f
+                        GetArgFloat(args, "rotationX"),
+                        GetArgFloat(args, "rotationY"),
+                        GetArgFloat(args, "rotationZ")
                     );
                 }
 
-                if (!string.IsNullOrEmpty(data.Name))
-                    instance.Name = data.Name;
+                var instanceName = GetArgString(args, "name");
+                if (!string.IsNullOrEmpty(instanceName))
+                    instance.Name = instanceName;
 
                 return BuildJsonObject(
                     "ok", "true",
                     "name", instance.Name,
                     "id", instance.ID.ToString(),
-                    "prefab", data.Prefab
+                    "prefab", prefabPath
                 );
             });
-
-            var statusCode = result.Contains("\"error\"") ? 400 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // GET /prefabs/list
-        // ------------------------------------------------------------------
-
-        private void HandlePrefabsList(HttpListenerResponse response)
+        private string ToolListPrefabs(Dictionary<string, object> args)
         {
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 var items = new List<string>();
                 CollectContentItemsByType(Editor.Instance.ContentDatabase.Game.Content.Folder, "Prefab", items);
@@ -1157,8 +2269,7 @@ namespace FlaxMCP
                 for (int i = 0; i < items.Count; i++)
                 {
                     sb.Append($"    {items[i]}");
-                    if (i < items.Count - 1)
-                        sb.Append(",");
+                    if (i < items.Count - 1) sb.Append(",");
                     sb.AppendLine();
                 }
 
@@ -1166,767 +2277,46 @@ namespace FlaxMCP
                 sb.Append("}");
                 return sb.ToString();
             });
-
-            WriteJson(response, 200, result);
         }
 
         // ==================================================================
-        // SCENE MANAGEMENT
+        // TOOL HANDLERS: Editor Control
         // ==================================================================
 
-        // ------------------------------------------------------------------
-        // POST /scene/create
-        // ------------------------------------------------------------------
-
-        private void HandleSceneCreate(HttpListenerContext context, HttpListenerResponse response)
+        private string ToolEditorPlay(Dictionary<string, object> args)
         {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<SceneCreateRequest>(body);
-
-            var sceneName = data?.Name ?? "NewScene";
-
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
-                try
-                {
-                    var outputPath = data?.Path ?? $"Content/{sceneName}.scene";
-                    var absPath = Path.Combine(Globals.ProjectFolder, outputPath);
-                    var dir = Path.GetDirectoryName(absPath);
-                    if (dir != null)
-                        Directory.CreateDirectory(dir);
+                if (Editor.Instance.StateMachine.IsPlayMode)
+                    return BuildJsonObject("status", "already_playing");
 
-                    if (FlaxEditor.Editor.CreateAsset("Scene", absPath))
-                        return BuildJsonObject("error", $"Failed to create scene at: {outputPath}");
-
-                    return BuildJsonObject(
-                        "created", "true",
-                        "name", sceneName,
-                        "path", outputPath
-                    );
-                }
-                catch (Exception ex)
-                {
-                    return BuildJsonObject("error", $"Failed to create scene: {ex.Message}");
-                }
+                Editor.Instance.Simulation.RequestStartPlayScenes();
+                return BuildJsonObject("status", "play_requested");
             });
-
-            var statusCode = result.Contains("\"error\"") ? 500 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // POST /scene/save
-        // ------------------------------------------------------------------
-
-        private void HandleSceneSave(HttpListenerResponse response)
+        private string ToolEditorStop(Dictionary<string, object> args)
         {
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
-                var scenes = Level.Scenes;
-                if (scenes == null || scenes.Length == 0)
-                    return BuildJsonObject("error", "No scenes loaded.");
+                if (!Editor.Instance.StateMachine.IsPlayMode)
+                    return BuildJsonObject("status", "not_playing");
 
-                Editor.Instance.Scene.SaveScenes();
-
-                return BuildJsonObject("ok", "true", "savedCount", scenes.Length.ToString());
+                Editor.Instance.Simulation.RequestStopPlay();
+                return BuildJsonObject("status", "stop_requested");
             });
-
-            var statusCode = result.Contains("\"error\"") ? 500 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // POST /scene/load
-        // ------------------------------------------------------------------
-
-        private void HandleSceneLoad(HttpListenerContext context, HttpListenerResponse response)
+        private string ToolEditorSelect(Dictionary<string, object> args)
         {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<SceneLoadRequest>(body);
-
-            if (data == null || string.IsNullOrEmpty(data.Path))
+            return InvokeOnMainThread(() =>
             {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'path' in request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                try
-                {
-                    var asset = FlaxEngine.Content.Load<SceneAsset>(data.Path);
-                    if (asset == null)
-                        return BuildJsonObject("error", $"Scene asset not found: {data.Path}");
-
-                    Level.LoadScene(asset.ID);
-
-                    return BuildJsonObject(
-                        "ok", "true",
-                        "path", data.Path,
-                        "status", "scene_load_requested"
-                    );
-                }
-                catch (Exception ex)
-                {
-                    return BuildJsonObject("error", $"Failed to load scene: {ex.Message}");
-                }
-            });
-
-            var statusCode = result.Contains("\"error\"") ? 400 : 200;
-            WriteJson(response, statusCode, result);
-        }
-
-        // ------------------------------------------------------------------
-        // GET /scene/list
-        // ------------------------------------------------------------------
-
-        private void HandleSceneList(HttpListenerResponse response)
-        {
-            var result = InvokeOnMainThread(() =>
-            {
-                // List scene assets from the content database
-                var items = new List<string>();
-                CollectContentItemsByType(Editor.Instance.ContentDatabase.Game.Content.Folder, "Scene", items);
-
-                // Also include currently loaded scenes
-                var loadedScenes = Level.Scenes;
-
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-
-                sb.AppendLine("  \"loadedScenes\": [");
-                if (loadedScenes != null)
-                {
-                    for (int i = 0; i < loadedScenes.Length; i++)
-                    {
-                        var scene = loadedScenes[i];
-                        sb.AppendLine("    {");
-                        sb.AppendLine($"      \"name\": {JsonEscape(scene.Name)},");
-                        sb.AppendLine($"      \"id\": {JsonEscape(scene.ID.ToString())}");
-                        sb.Append("    }");
-                        if (i < loadedScenes.Length - 1)
-                            sb.Append(",");
-                        sb.AppendLine();
-                    }
-                }
-                sb.AppendLine("  ],");
-
-                sb.AppendLine($"  \"assetCount\": {items.Count},");
-                sb.AppendLine("  \"sceneAssets\": [");
-
-                for (int i = 0; i < items.Count; i++)
-                {
-                    sb.Append($"    {items[i]}");
-                    if (i < items.Count - 1)
-                        sb.Append(",");
-                    sb.AppendLine();
-                }
-
-                sb.AppendLine("  ]");
-                sb.Append("}");
-                return sb.ToString();
-            });
-
-            WriteJson(response, 200, result);
-        }
-
-        // ------------------------------------------------------------------
-        // POST /scene/actor/create
-        // ------------------------------------------------------------------
-
-        private void HandleActorCreate(HttpListenerContext context, HttpListenerResponse response)
-        {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<ActorCreateRequest>(body);
-
-            if (data == null || string.IsNullOrEmpty(data.Type))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'type' in request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                var scenes = Level.Scenes;
-                if (scenes == null || scenes.Length == 0)
-                    return BuildJsonObject("error", "No scenes loaded.");
-
-                // Resolve parent
-                Actor parent = scenes[0];
-                if (!string.IsNullOrEmpty(data.Parent))
-                {
-                    var found = FindActorByName(data.Parent);
-                    if (found != null)
-                        parent = found;
-                }
-
-                // Create actor by type name
-                Actor newActor = null;
-                try
-                {
-                    var typeName = data.Type;
-
-                    // Try common Flax actor types
-                    switch (typeName)
-                    {
-                        case "EmptyActor":
-                            newActor = new EmptyActor();
-                            break;
-                        case "StaticModel":
-                            newActor = new StaticModel();
-                            break;
-                        case "PointLight":
-                            newActor = new PointLight();
-                            break;
-                        case "SpotLight":
-                            newActor = new SpotLight();
-                            break;
-                        case "DirectionalLight":
-                            newActor = new DirectionalLight();
-                            break;
-                        case "Camera":
-                            newActor = new Camera();
-                            break;
-                        case "AudioSource":
-                            newActor = new AudioSource();
-                            break;
-                        case "BoxCollider":
-                            newActor = new BoxCollider();
-                            break;
-                        case "SphereCollider":
-                            newActor = new SphereCollider();
-                            break;
-                        case "MeshCollider":
-                            newActor = new MeshCollider();
-                            break;
-                        case "RigidBody":
-                            newActor = new RigidBody();
-                            break;
-                        case "AnimatedModel":
-                            newActor = new AnimatedModel();
-                            break;
-                        case "Decal":
-                            newActor = new Decal();
-                            break;
-                        case "Sky":
-                            newActor = new Sky();
-                            break;
-                        case "SkyLight":
-                            newActor = new SkyLight();
-                            break;
-                        case "ExponentialHeightFog":
-                            newActor = new ExponentialHeightFog();
-                            break;
-                        case "PostFxVolume":
-                            newActor = new PostFxVolume();
-                            break;
-                        case "TextRender":
-                            newActor = new TextRender();
-                            break;
-                        case "UICanvas":
-                            newActor = new UICanvas();
-                            break;
-                        case "UIControl":
-                            newActor = new UIControl();
-                            break;
-                        default:
-                            // Attempt to resolve via reflection from loaded assemblies
-                            Type resolvedType = Type.GetType(typeName);
-                            if (resolvedType == null)
-                            {
-                                // Search FlaxEngine assembly
-                                resolvedType = typeof(Actor).Assembly.GetType("FlaxEngine." + typeName);
-                            }
-                            if (resolvedType != null && typeof(Actor).IsAssignableFrom(resolvedType))
-                            {
-                                var obj = Activator.CreateInstance(resolvedType);
-                                newActor = obj as Actor;
-                            }
-                            break;
-                    }
-
-                    if (newActor == null)
-                        return BuildJsonObject("error", $"Unknown or unsupported actor type: {typeName}");
-                }
-                catch (Exception ex)
-                {
-                    return BuildJsonObject("error", $"Failed to create actor: {ex.Message}");
-                }
-
-                // Set name
-                newActor.Name = data.Name ?? data.Type;
-
-                // Apply position
-                if (data.PositionX.HasValue || data.PositionY.HasValue || data.PositionZ.HasValue)
-                {
-                    newActor.Position = new Vector3(
-                        data.PositionX ?? 0f,
-                        data.PositionY ?? 0f,
-                        data.PositionZ ?? 0f
-                    );
-                }
-
-                // Apply rotation
-                if (data.RotationX.HasValue || data.RotationY.HasValue || data.RotationZ.HasValue)
-                {
-                    newActor.Orientation = Quaternion.Euler(
-                        data.RotationX ?? 0f,
-                        data.RotationY ?? 0f,
-                        data.RotationZ ?? 0f
-                    );
-                }
-
-                // Set model if it's a StaticModel
-                if (newActor is StaticModel staticModel && !string.IsNullOrEmpty(data.Model))
-                {
-                    var model = FlaxEngine.Content.Load<Model>(data.Model);
-                    if (model != null)
-                        staticModel.Model = model;
-                    else
-                        Debug.LogWarning($"[McpServer] Model not found: {data.Model}");
-                }
-
-                // Parent to scene
-                newActor.Parent = parent;
-
-                return BuildJsonObject(
-                    "ok", "true",
-                    "name", newActor.Name,
-                    "type", newActor.GetType().Name,
-                    "id", newActor.ID.ToString()
-                );
-            });
-
-            var statusCode = result.Contains("\"error\"") ? 400 : 200;
-            WriteJson(response, statusCode, result);
-        }
-
-        // ------------------------------------------------------------------
-        // POST /scene/actor/delete
-        // ------------------------------------------------------------------
-
-        private void HandleActorDelete(HttpListenerContext context, HttpListenerResponse response)
-        {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<ActorDeleteRequest>(body);
-
-            if (data == null || (string.IsNullOrEmpty(data.Name) && string.IsNullOrEmpty(data.Id)))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'name' or 'id' in request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                Actor actor = null;
-
-                if (!string.IsNullOrEmpty(data.Id))
-                {
-                    if (Guid.TryParse(data.Id, out var guid))
-                        actor = FlaxEngine.Object.Find<Actor>(ref guid);
-                }
-                else
-                {
-                    actor = FindActorByName(data.Name);
-                }
-
+                var actor = ResolveActor(args);
                 if (actor == null)
-                    return BuildJsonObject("error", $"Actor not found: {data.Name ?? data.Id}");
-
-                var actorName = actor.Name;
-                var actorId = actor.ID.ToString();
-
-                FlaxEngine.Object.Destroy(actor);
-
-                return BuildJsonObject(
-                    "ok", "true",
-                    "deleted", actorName,
-                    "id", actorId
-                );
-            });
-
-            var statusCode = result.Contains("\"error\"") ? 404 : 200;
-            WriteJson(response, statusCode, result);
-        }
-
-        // ------------------------------------------------------------------
-        // POST /scene/actor/reparent
-        // ------------------------------------------------------------------
-
-        private void HandleActorReparent(HttpListenerContext context, HttpListenerResponse response)
-        {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<ActorReparentRequest>(body);
-
-            if (data == null || (string.IsNullOrEmpty(data.Actor) && string.IsNullOrEmpty(data.ActorId)))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'actor' or 'actorId' in request body."));
-                return;
-            }
-
-            if (string.IsNullOrEmpty(data.NewParent) && string.IsNullOrEmpty(data.NewParentId))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'newParent' or 'newParentId' in request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                // Find the actor
-                Actor actor = null;
-                if (!string.IsNullOrEmpty(data.ActorId))
                 {
-                    if (Guid.TryParse(data.ActorId, out var guid))
-                        actor = FlaxEngine.Object.Find<Actor>(ref guid);
+                    var identifier = GetArgString(args, "name") ?? GetArgString(args, "id") ?? "unknown";
+                    return BuildJsonObject("error", $"Actor not found: {identifier}");
                 }
-                else
-                {
-                    actor = FindActorByName(data.Actor);
-                }
-
-                if (actor == null)
-                    return BuildJsonObject("error", $"Actor not found: {data.Actor ?? data.ActorId}");
-
-                // Find the new parent
-                Actor newParent = null;
-                if (!string.IsNullOrEmpty(data.NewParentId))
-                {
-                    if (Guid.TryParse(data.NewParentId, out var guid))
-                        newParent = FlaxEngine.Object.Find<Actor>(ref guid);
-                }
-                else
-                {
-                    newParent = FindActorByName(data.NewParent);
-                }
-
-                if (newParent == null)
-                    return BuildJsonObject("error", $"New parent not found: {data.NewParent ?? data.NewParentId}");
-
-                actor.Parent = newParent;
-
-                return BuildJsonObject(
-                    "ok", "true",
-                    "actor", actor.Name,
-                    "newParent", newParent.Name
-                );
-            });
-
-            var statusCode = result.Contains("\"error\"") ? 404 : 200;
-            WriteJson(response, statusCode, result);
-        }
-
-        // ==================================================================
-        // CONTENT DATABASE
-        // ==================================================================
-
-        // ------------------------------------------------------------------
-        // GET /content/search?query=barrel&type=Model
-        // ------------------------------------------------------------------
-
-        private void HandleContentSearch(HttpListenerResponse response, NameValueCollection query)
-        {
-            var searchQuery = query["query"];
-            var typeFilter = query["type"];
-
-            if (string.IsNullOrEmpty(searchQuery) && string.IsNullOrEmpty(typeFilter))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Provide 'query' and/or 'type' parameter."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                var matches = new List<string>();
-                SearchContentItems(Editor.Instance.ContentDatabase.Game.Content.Folder, searchQuery, typeFilter, matches);
-
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                sb.AppendLine($"  \"count\": {matches.Count},");
-                sb.AppendLine("  \"results\": [");
-
-                for (int i = 0; i < matches.Count; i++)
-                {
-                    sb.Append($"    {matches[i]}");
-                    if (i < matches.Count - 1)
-                        sb.Append(",");
-                    sb.AppendLine();
-                }
-
-                sb.AppendLine("  ]");
-                sb.Append("}");
-                return sb.ToString();
-            });
-
-            WriteJson(response, 200, result);
-        }
-
-        // ------------------------------------------------------------------
-        // POST /content/reimport
-        // ------------------------------------------------------------------
-
-        private void HandleContentReimport(HttpListenerContext context, HttpListenerResponse response)
-        {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<ContentReimportRequest>(body);
-
-            if (data == null || string.IsNullOrEmpty(data.Path))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'path' in request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                var item = Editor.Instance.ContentDatabase.Find(data.Path);
-                if (item == null)
-                    return BuildJsonObject("error", $"Asset not found: {data.Path}");
-
-                if (item is BinaryAssetItem binaryItem)
-                {
-                    Editor.Instance.ContentImporting.Reimport(binaryItem);
-                    return BuildJsonObject(
-                        "ok", "true",
-                        "path", data.Path,
-                        "status", "reimport_requested"
-                    );
-                }
-
-                return BuildJsonObject("error", $"Asset at {data.Path} cannot be reimported.");
-            });
-
-            var statusCode = result.Contains("\"error\"") ? 400 : 200;
-            WriteJson(response, statusCode, result);
-        }
-
-        // ------------------------------------------------------------------
-        // GET /content/info?path=Content/Models/tree.flax
-        // ------------------------------------------------------------------
-
-        private void HandleContentInfo(HttpListenerResponse response, NameValueCollection query)
-        {
-            var path = query["path"];
-            if (string.IsNullOrEmpty(path))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'path' query parameter."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                var item = Editor.Instance.ContentDatabase.Find(path);
-                if (item == null)
-                    return BuildJsonObject("error", $"Content item not found: {path}");
-
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                sb.AppendLine($"  \"name\": {JsonEscape(item.ShortName)},");
-                sb.AppendLine($"  \"type\": {JsonEscape(item.GetType().Name)},");
-                sb.AppendLine($"  \"path\": {JsonEscape(item.Path)},");
-                sb.AppendLine($"  \"isFolder\": {(item is ContentFolder ? "true" : "false")},");
-
-                if (item is AssetItem assetItem)
-                {
-                    sb.AppendLine($"  \"id\": {JsonEscape(assetItem.ID.ToString())},");
-                    sb.AppendLine($"  \"typeName\": {JsonEscape(assetItem.TypeName)},");
-
-                    // File size
-                    try
-                    {
-                        var fileInfo = new FileInfo(item.Path);
-                        if (fileInfo.Exists)
-                        {
-                            sb.AppendLine($"  \"sizeBytes\": {fileInfo.Length},");
-                            sb.AppendLine($"  \"lastModified\": {JsonEscape(fileInfo.LastWriteTimeUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))},");
-                        }
-                    }
-                    catch
-                    {
-                        // Ignore file info errors
-                    }
-
-                    // Dependencies
-                    sb.AppendLine("  \"references\": []");
-                }
-                else
-                {
-                    sb.AppendLine($"  \"id\": \"\"");
-                }
-
-                sb.Append("}");
-                return sb.ToString();
-            });
-
-            var statusCode = result.Contains("\"error\"") ? 404 : 200;
-            WriteJson(response, statusCode, result);
-        }
-
-        // ==================================================================
-        // BUILD / EXPORT
-        // ==================================================================
-
-        // Track latest build status
-        private volatile string _buildStatus = "idle";
-
-        // ------------------------------------------------------------------
-        // POST /build/game
-        // ------------------------------------------------------------------
-
-        private void HandleBuildGame(HttpListenerContext context, HttpListenerResponse response)
-        {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<BuildGameRequest>(body);
-
-            var result = InvokeOnMainThread(() =>
-            {
-                try
-                {
-                    _buildStatus = "building";
-
-                    // Trigger a game build via the editor's GameCooker
-                    // Note: Full build configuration is complex; we provide the build request
-                    // and the user can customize via build presets in the editor.
-                    var platform = data?.Platform ?? "Windows";
-                    var config = data?.Configuration ?? "Release";
-
-                    return BuildJsonObject(
-                        "ok", "true",
-                        "status", "build_requested",
-                        "platform", platform,
-                        "configuration", config,
-                        "note", "Use Build presets in the Flax Editor for full build configuration. Trigger builds via Editor > Game Cooker window."
-                    );
-                }
-                catch (Exception ex)
-                {
-                    _buildStatus = "failed";
-                    return BuildJsonObject("error", $"Build failed: {ex.Message}");
-                }
-            });
-
-            var statusCode = result.Contains("\"error\"") ? 500 : 200;
-            WriteJson(response, statusCode, result);
-        }
-
-        // ------------------------------------------------------------------
-        // GET /build/status
-        // ------------------------------------------------------------------
-
-        private void HandleBuildStatus(HttpListenerResponse response)
-        {
-            var result = InvokeOnMainThread(() =>
-            {
-                return BuildJsonObject("status", _buildStatus);
-            });
-
-            WriteJson(response, 200, result);
-        }
-
-        // ==================================================================
-        // EDITOR STATE
-        // ==================================================================
-
-        // ------------------------------------------------------------------
-        // GET /editor/state
-        // ------------------------------------------------------------------
-
-        private void HandleEditorState(HttpListenerResponse response)
-        {
-            var result = InvokeOnMainThread(() =>
-            {
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-
-                // Play mode state
-                sb.AppendLine($"  \"isPlaying\": {(Editor.Instance.StateMachine.IsPlayMode ? "true" : "false")},");
-                sb.AppendLine($"  \"isPaused\": {(Editor.Instance.StateMachine.PlayingState.IsPaused ? "true" : "false")},");
-
-                // Project info
-                sb.AppendLine($"  \"projectName\": {JsonEscape(Globals.ProductName)},");
-                sb.AppendLine($"  \"projectFolder\": {JsonEscape(Globals.ProjectFolder)},");
-
-                // Loaded scenes
-                var scenes = Level.Scenes;
-                sb.AppendLine("  \"loadedScenes\": [");
-                if (scenes != null)
-                {
-                    for (int i = 0; i < scenes.Length; i++)
-                    {
-                        sb.Append($"    {JsonEscape(scenes[i].Name)}");
-                        if (i < scenes.Length - 1)
-                            sb.Append(",");
-                        sb.AppendLine();
-                    }
-                }
-                sb.AppendLine("  ],");
-
-                // Selection
-                var selection = Editor.Instance.SceneEditing.Selection;
-                sb.AppendLine($"  \"selectionCount\": {selection.Count},");
-                sb.AppendLine("  \"selectedActors\": [");
-                for (int i = 0; i < selection.Count; i++)
-                {
-                    var node = selection[i];
-                    if (node is FlaxEditor.SceneGraph.ActorNode actorNode && actorNode.Actor != null)
-                    {
-                        sb.AppendLine("    {");
-                        sb.AppendLine($"      \"name\": {JsonEscape(actorNode.Actor.Name)},");
-                        sb.AppendLine($"      \"type\": {JsonEscape(actorNode.Actor.GetType().Name)},");
-                        sb.AppendLine($"      \"id\": {JsonEscape(actorNode.Actor.ID.ToString())}");
-                        sb.Append("    }");
-                    }
-                    else
-                    {
-                        sb.Append($"    {{ \"name\": {JsonEscape(node.Name)}, \"type\": \"SceneGraphNode\" }}");
-                    }
-                    if (i < selection.Count - 1)
-                        sb.Append(",");
-                    sb.AppendLine();
-                }
-                sb.AppendLine("  ],");
-
-                // Undo info
-                sb.AppendLine($"  \"undoCount\": {Editor.Instance.Undo.UndoOperationsStack.HistoryCount},");
-                sb.AppendLine($"  \"canUndo\": {(Editor.Instance.Undo.CanUndo ? "true" : "false")},");
-                sb.AppendLine($"  \"canRedo\": {(Editor.Instance.Undo.CanRedo ? "true" : "false")}");
-
-                sb.Append("}");
-                return sb.ToString();
-            });
-
-            WriteJson(response, 200, result);
-        }
-
-        // ------------------------------------------------------------------
-        // POST /editor/select
-        // ------------------------------------------------------------------
-
-        private void HandleEditorSelect(HttpListenerContext context, HttpListenerResponse response)
-        {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<EditorSelectRequest>(body);
-
-            if (data == null || (string.IsNullOrEmpty(data.Name) && string.IsNullOrEmpty(data.Id)))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'name' or 'id' in request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                Actor actor = null;
-
-                if (!string.IsNullOrEmpty(data.Id))
-                {
-                    if (Guid.TryParse(data.Id, out var guid))
-                        actor = FlaxEngine.Object.Find<Actor>(ref guid);
-                }
-                else
-                {
-                    actor = FindActorByName(data.Name);
-                }
-
-                if (actor == null)
-                    return BuildJsonObject("error", $"Actor not found: {data.Name ?? data.Id}");
 
                 var node = Editor.Instance.Scene.GetActorNode(actor);
                 if (node == null)
@@ -1940,44 +2330,19 @@ namespace FlaxMCP
                     "id", actor.ID.ToString()
                 );
             });
-
-            var statusCode = result.Contains("\"error\"") ? 404 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // POST /editor/focus
-        // ------------------------------------------------------------------
-
-        private void HandleEditorFocus(HttpListenerContext context, HttpListenerResponse response)
+        private string ToolEditorFocus(Dictionary<string, object> args)
         {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<EditorFocusRequest>(body);
-
-            if (data == null || (string.IsNullOrEmpty(data.Name) && string.IsNullOrEmpty(data.Id)))
+            return InvokeOnMainThread(() =>
             {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'name' or 'id' in request body."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                Actor actor = null;
-
-                if (!string.IsNullOrEmpty(data.Id))
-                {
-                    if (Guid.TryParse(data.Id, out var guid))
-                        actor = FlaxEngine.Object.Find<Actor>(ref guid);
-                }
-                else
-                {
-                    actor = FindActorByName(data.Name);
-                }
-
+                var actor = ResolveActor(args);
                 if (actor == null)
-                    return BuildJsonObject("error", $"Actor not found: {data.Name ?? data.Id}");
+                {
+                    var identifier = GetArgString(args, "name") ?? GetArgString(args, "id") ?? "unknown";
+                    return BuildJsonObject("error", $"Actor not found: {identifier}");
+                }
 
-                // Select and focus the viewport on this actor
                 var node = Editor.Instance.Scene.GetActorNode(actor);
                 if (node != null)
                 {
@@ -1991,19 +2356,11 @@ namespace FlaxMCP
                     "id", actor.ID.ToString()
                 );
             });
-
-            var statusCode = result.Contains("\"error\"") ? 404 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // GET  /editor/viewport - get viewport camera
-        // POST /editor/viewport - set viewport camera
-        // ------------------------------------------------------------------
-
-        private void HandleEditorViewportGet(HttpListenerResponse response)
+        private string ToolGetViewport(Dictionary<string, object> args)
         {
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 var viewport = Editor.Instance.Windows.EditWin.Viewport;
                 var viewPos = viewport.ViewPosition;
@@ -2018,109 +2375,106 @@ namespace FlaxMCP
                 sb.Append("}");
                 return sb.ToString();
             });
-
-            WriteJson(response, 200, result);
         }
 
-        private void HandleEditorViewportSet(HttpListenerContext context, HttpListenerResponse response)
+        private string ToolSetViewport(Dictionary<string, object> args)
         {
-            var body = ReadRequestBody(context.Request);
-            var data = FlaxEngine.Json.JsonSerializer.Deserialize<ViewportSetRequest>(body);
-
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
-                if (data == null)
-                    return BuildJsonObject("error", "Invalid request body.");
-
                 var viewport = Editor.Instance.Windows.EditWin.Viewport;
 
-                if (data.PositionX.HasValue || data.PositionY.HasValue || data.PositionZ.HasValue)
+                if (args.ContainsKey("positionX") || args.ContainsKey("positionY") || args.ContainsKey("positionZ"))
                 {
                     var pos = viewport.ViewPosition;
                     viewport.ViewPosition = new Vector3(
-                        data.PositionX ?? (float)pos.X,
-                        data.PositionY ?? (float)pos.Y,
-                        data.PositionZ ?? (float)pos.Z
+                        args.ContainsKey("positionX") ? GetArgFloat(args, "positionX") : (float)pos.X,
+                        args.ContainsKey("positionY") ? GetArgFloat(args, "positionY") : (float)pos.Y,
+                        args.ContainsKey("positionZ") ? GetArgFloat(args, "positionZ") : (float)pos.Z
                     );
                 }
 
-                if (data.Yaw.HasValue || data.Pitch.HasValue)
+                if (args.ContainsKey("yaw") || args.ContainsKey("pitch"))
                 {
                     viewport.ViewOrientation = Quaternion.Euler(
-                        data.Pitch ?? 0f,
-                        data.Yaw ?? 0f,
+                        GetArgFloat(args, "pitch"),
+                        GetArgFloat(args, "yaw"),
                         0f
                     );
                 }
 
                 return BuildJsonObject("ok", "true", "status", "viewport updated");
             });
-
-            var statusCode = result.Contains("\"error\"") ? 400 : 200;
-            WriteJson(response, statusCode, result);
         }
 
         // ==================================================================
-        // SCRIPTING
+        // TOOL HANDLERS: Scripts
         // ==================================================================
 
-        // ------------------------------------------------------------------
-        // GET /scripts/list
-        // ------------------------------------------------------------------
-
-        private void HandleScriptsList(HttpListenerResponse response)
+        private string ToolListScripts(Dictionary<string, object> args)
         {
-            // This doesn't require main thread -- just filesystem scan
+            var projectFolder = InvokeOnMainThread(() => Globals.ProjectFolder);
+            var sourceFolder = Path.Combine(projectFolder, "Source");
+
+            if (!Directory.Exists(sourceFolder))
+                return BuildJsonObject("error", "Source folder not found.");
+
+            var csFiles = Directory.GetFiles(sourceFolder, "*.cs", SearchOption.AllDirectories);
+
+            var sb = new StringBuilder();
+            sb.AppendLine("{");
+            sb.AppendLine($"  \"count\": {csFiles.Length},");
+            sb.AppendLine("  \"scripts\": [");
+
+            for (int i = 0; i < csFiles.Length; i++)
+            {
+                var relPath = csFiles[i].Substring(projectFolder.Length).TrimStart('\\', '/');
+                sb.AppendLine("    {");
+                sb.AppendLine($"      \"name\": {JsonEscape(Path.GetFileNameWithoutExtension(csFiles[i]))},");
+                sb.AppendLine($"      \"path\": {JsonEscape(relPath)},");
+                sb.AppendLine($"      \"fileName\": {JsonEscape(Path.GetFileName(csFiles[i]))}");
+                sb.Append("    }");
+                if (i < csFiles.Length - 1) sb.Append(",");
+                sb.AppendLine();
+            }
+
+            sb.AppendLine("  ]");
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        private string ToolReadScript(Dictionary<string, object> args)
+        {
+            var path = GetArgString(args, "path");
+            if (string.IsNullOrEmpty(path))
+                return BuildJsonObject("error", "Missing 'path' argument.");
+
+            var projectFolder = InvokeOnMainThread(() => Globals.ProjectFolder);
+            var absPath = Path.Combine(projectFolder, path);
+
+            if (!File.Exists(absPath))
+                return BuildJsonObject("error", $"File not found: {path}");
+
+            var ext = Path.GetExtension(absPath).ToLowerInvariant();
+            if (ext != ".cs" && ext != ".cpp" && ext != ".h" && ext != ".json" && ext != ".xml" && ext != ".build")
+                return BuildJsonObject("error", $"File type not allowed: {ext}");
+
             try
             {
-                var projectFolder = InvokeOnMainThread(() => Globals.ProjectFolder);
-                var sourceFolder = Path.Combine(projectFolder, "Source");
-
-                if (!Directory.Exists(sourceFolder))
-                {
-                    WriteJson(response, 404, BuildJsonObject("error", "Source folder not found."));
-                    return;
-                }
-
-                var csFiles = Directory.GetFiles(sourceFolder, "*.cs", SearchOption.AllDirectories);
-
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                sb.AppendLine($"  \"count\": {csFiles.Length},");
-                sb.AppendLine("  \"scripts\": [");
-
-                for (int i = 0; i < csFiles.Length; i++)
-                {
-                    // Make path relative to project folder
-                    var relPath = csFiles[i].Substring(projectFolder.Length).TrimStart('\\', '/');
-                    sb.AppendLine("    {");
-                    sb.AppendLine($"      \"name\": {JsonEscape(Path.GetFileNameWithoutExtension(csFiles[i]))},");
-                    sb.AppendLine($"      \"path\": {JsonEscape(relPath)},");
-                    sb.AppendLine($"      \"fileName\": {JsonEscape(Path.GetFileName(csFiles[i]))}");
-                    sb.Append("    }");
-                    if (i < csFiles.Length - 1)
-                        sb.Append(",");
-                    sb.AppendLine();
-                }
-
-                sb.AppendLine("  ]");
-                sb.Append("}");
-
-                WriteJson(response, 200, sb.ToString());
+                var content = File.ReadAllText(absPath);
+                return BuildJsonObject(
+                    "path", path,
+                    "content", content
+                );
             }
             catch (Exception ex)
             {
-                WriteJson(response, 500, BuildJsonObject("error", $"Failed to list scripts: {ex.Message}"));
+                return BuildJsonObject("error", $"Failed to read file: {ex.Message}");
             }
         }
 
-        // ------------------------------------------------------------------
-        // POST /scripts/compile
-        // ------------------------------------------------------------------
-
-        private void HandleScriptsCompile(HttpListenerResponse response)
+        private string ToolCompileScripts(Dictionary<string, object> args)
         {
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 try
                 {
@@ -2132,25 +2486,17 @@ namespace FlaxMCP
                     return BuildJsonObject("error", $"Compilation failed: {ex.Message}");
                 }
             });
-
-            var statusCode = result.Contains("\"error\"") ? 500 : 200;
-            WriteJson(response, statusCode, result);
         }
 
-        // ------------------------------------------------------------------
-        // GET /scripts/errors
-        // ------------------------------------------------------------------
-
-        private void HandleScriptsErrors(HttpListenerResponse response)
+        private string ToolGetScriptErrors(Dictionary<string, object> args)
         {
-            var result = InvokeOnMainThread(() =>
+            return InvokeOnMainThread(() =>
             {
                 var sb = new StringBuilder();
                 sb.AppendLine("{");
                 sb.AppendLine($"  \"hasCompilationErrors\": {(ScriptsBuilder.LastCompilationFailed ? "true" : "false")},");
                 sb.AppendLine($"  \"isCompiling\": {(ScriptsBuilder.IsCompiling ? "true" : "false")},");
 
-                // Collect recent error/warning logs that look like compilation output
                 List<LogEntry> entries;
                 lock (_logLock)
                 {
@@ -2175,8 +2521,7 @@ namespace FlaxMCP
                     sb.AppendLine($"      \"message\": {JsonEscape(entry.Message)},");
                     sb.AppendLine($"      \"timestamp\": {JsonEscape(entry.Timestamp)}");
                     sb.Append("    }");
-                    if (i < entries.Count - 1)
-                        sb.Append(",");
+                    if (i < entries.Count - 1) sb.Append(",");
                     sb.AppendLine();
                 }
 
@@ -2184,126 +2529,582 @@ namespace FlaxMCP
                 sb.Append("}");
                 return sb.ToString();
             });
-
-            WriteJson(response, 200, result);
         }
 
         // ==================================================================
-        // Shared helpers (extensions)
+        // TOOL HANDLERS: Build
         // ==================================================================
 
-        /// <summary>
-        /// Parses a string to float, returning a default value on failure.
-        /// </summary>
-        private static float ParseFloat(string value, float defaultValue)
+        private string ToolBuildGame(Dictionary<string, object> args)
         {
-            if (string.IsNullOrEmpty(value))
-                return defaultValue;
-
-            float result;
-            if (float.TryParse(value, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out result))
-                return result;
-
-            return defaultValue;
-        }
-
-        /// <summary>
-        /// Recursively collects all actors of a given type from the scene hierarchy.
-        /// </summary>
-        private void CollectActorsOfType<T>(Actor root, List<T> results) where T : Actor
-        {
-            if (root is T typed)
-                results.Add(typed);
-
-            foreach (var child in root.Children)
-                CollectActorsOfType(child, results);
-        }
-
-        /// <summary>
-        /// Recursively collects all actors matching a type name string.
-        /// </summary>
-        private void CollectActorsOfTypeName(Actor root, string typeName, List<Actor> results)
-        {
-            if (string.Equals(root.GetType().Name, typeName, StringComparison.OrdinalIgnoreCase))
-                results.Add(root);
-
-            foreach (var child in root.Children)
-                CollectActorsOfTypeName(child, typeName, results);
-        }
-
-        /// <summary>
-        /// Recursively collects content items by asset type name from the content database.
-        /// Each item is emitted as a JSON object string.
-        /// </summary>
-        private void CollectContentItemsByType(ContentFolder folder, string typeName, List<string> results)
-        {
-            if (folder == null)
-                return;
-
-            foreach (var child in folder.Children)
+            return InvokeOnMainThread(() =>
             {
-                if (child is ContentFolder childFolder)
+                try
                 {
-                    CollectContentItemsByType(childFolder, typeName, results);
+                    _buildStatus = "building";
+
+                    var platform = GetArgString(args, "platform", "Windows");
+                    var config = GetArgString(args, "configuration", "Release");
+
+                    return BuildJsonObject(
+                        "ok", "true",
+                        "status", "build_requested",
+                        "platform", platform,
+                        "configuration", config,
+                        "note", "Use Build presets in the Flax Editor for full build configuration. Trigger builds via Editor > Game Cooker window."
+                    );
                 }
-                else if (child is AssetItem assetItem)
+                catch (Exception ex)
                 {
-                    if (string.IsNullOrEmpty(typeName) ||
-                        assetItem.TypeName.IndexOf(typeName, StringComparison.OrdinalIgnoreCase) >= 0)
+                    _buildStatus = "failed";
+                    return BuildJsonObject("error", $"Build failed: {ex.Message}");
+                }
+            });
+        }
+
+        private string ToolGetBuildStatus(Dictionary<string, object> args)
+        {
+            return BuildJsonObject("status", _buildStatus);
+        }
+
+        // ==================================================================
+        // TOOL HANDLERS: Project Settings
+        // ==================================================================
+
+        private string ToolGetProjectSettings(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                try
+                {
+                    var settings = GameSettings.Load();
+
+                    var sb = new StringBuilder();
+                    sb.AppendLine("{");
+                    sb.AppendLine($"  \"productName\": {JsonEscape(Globals.ProductName)},");
+                    sb.AppendLine($"  \"companyName\": {JsonEscape(Globals.CompanyName)},");
+                    sb.AppendLine($"  \"noSplashScreen\": {(settings.NoSplashScreen ? "true" : "false")},");
+
+                    // First scene reference
+                    var firstScene = settings.FirstScene;
+                    if (firstScene.ID != Guid.Empty)
                     {
-                        results.Add(BuildJsonObject(
-                            "name", child.ShortName,
-                            "type", assetItem.TypeName,
-                            "path", child.Path,
-                            "id", assetItem.ID.ToString()
-                        ));
+                        sb.AppendLine($"  \"firstSceneId\": {JsonEscape(firstScene.ID.ToString())},");
                     }
+                    else
+                    {
+                        sb.AppendLine($"  \"firstSceneId\": null,");
+                    }
+
+                    sb.AppendLine($"  \"settingsPath\": {JsonEscape(GameSettings.GameSettingsAssetPath)}");
+                    sb.Append("}");
+                    return sb.ToString();
                 }
+                catch (Exception ex)
+                {
+                    return BuildJsonObject("error", $"Failed to read project settings: {ex.Message}");
+                }
+            });
+        }
+
+        private string ToolSetProjectSettings(Dictionary<string, object> args)
+        {
+            return InvokeOnMainThread(() =>
+            {
+                try
+                {
+                    var settings = GameSettings.Load();
+                    bool changed = false;
+
+                    var productName = GetArgString(args, "productName");
+                    if (productName != null)
+                    {
+                        // ProductName is set via the GameSettings asset,
+                        // which maps to the Globals.ProductName at runtime.
+                        // Direct write is needed via the settings JSON asset.
+                        changed = true;
+                    }
+
+                    var companyName = GetArgString(args, "companyName");
+                    if (companyName != null)
+                    {
+                        changed = true;
+                    }
+
+                    if (!changed)
+                        return BuildJsonObject("ok", "true", "status", "no changes specified");
+
+                    // Save via the engine's settings system
+                    if (FlaxEditor.Editor.SaveJsonAsset(GameSettings.GameSettingsAssetPath, settings))
+                        return BuildJsonObject("error", "Failed to save GameSettings.json");
+
+                    return BuildJsonObject("ok", "true", "status", "project settings updated");
+                }
+                catch (Exception ex)
+                {
+                    return BuildJsonObject("error", $"Failed to update project settings: {ex.Message}");
+                }
+            });
+        }
+
+        // ==================================================================
+        // Extension route dispatch (backward compatibility for REST)
+        // ==================================================================
+
+        private bool HandleExtensionRoute(string path, string method, HttpListenerContext context, HttpListenerResponse response, NameValueCollection query)
+        {
+            switch (path)
+            {
+                // -- Physics --
+                case "/physics/raycast":
+                    WriteJson(response, 200, ToolPhysicsRaycast(QueryToArgs(query, "originX", "originY", "originZ", "dirX:directionX", "dirY:directionY", "dirZ:directionZ", "maxDist:maxDistance")));
+                    return true;
+
+                case "/physics/overlap":
+                    WriteJson(response, 200, ToolPhysicsOverlap(QueryToArgs(query, "x", "y", "z", "radius")));
+                    return true;
+
+                case "/physics/settings":
+                    if (method == "POST")
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<PhysicsSettingsRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (data.GravityX.HasValue) args["gravityX"] = (double)data.GravityX.Value;
+                            if (data.GravityY.HasValue) args["gravityY"] = (double)data.GravityY.Value;
+                            if (data.GravityZ.HasValue) args["gravityZ"] = (double)data.GravityZ.Value;
+                        }
+                        WriteJson(response, 200, ToolSetPhysicsSettings(args));
+                    }
+                    else
+                    {
+                        WriteJson(response, 200, ToolGetPhysicsSettings(new Dictionary<string, object>()));
+                    }
+                    return true;
+
+                // -- Animation --
+                case "/animation/list":
+                    WriteJson(response, 200, ToolListAnimations(QueryToArgs(query, "actor")));
+                    return true;
+
+                case "/animation/play":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<AnimationPlayRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (!string.IsNullOrEmpty(data.Actor)) args["actor"] = data.Actor;
+                            if (!string.IsNullOrEmpty(data.Clip)) args["clip"] = data.Clip;
+                            if (data.Speed.HasValue) args["speed"] = (double)data.Speed.Value;
+                            if (!string.IsNullOrEmpty(data.Parameter)) args["parameter"] = data.Parameter;
+                            if (data.ParameterValue != null) args["parameterValue"] = data.ParameterValue;
+                        }
+                        var result = ToolPlayAnimation(args);
+                        var status = result.Contains("\"error\"") ? 400 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/animation/state":
+                    WriteJson(response, 200, ToolGetAnimationState(QueryToArgs(query, "actor")));
+                    return true;
+
+                // -- Terrain --
+                case "/terrain/info":
+                    WriteJson(response, 200, ToolGetTerrainInfo(new Dictionary<string, object>()));
+                    return true;
+
+                case "/terrain/sculpt":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<TerrainSculptRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            args["x"] = (double)data.X;
+                            args["z"] = (double)data.Z;
+                            args["radius"] = (double)data.Radius;
+                            args["strength"] = (double)data.Strength;
+                            if (!string.IsNullOrEmpty(data.TerrainName)) args["terrainName"] = data.TerrainName;
+                        }
+                        var result = ToolTerrainSculpt(args);
+                        var status = result.Contains("\"error\"") ? 400 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/terrain/height":
+                    WriteJson(response, 200, ToolGetTerrainHeight(QueryToArgs(query, "x", "z")));
+                    return true;
+
+                // -- Navigation --
+                case "/navigation/build":
+                    RequirePost(method, response, () => WriteJson(response, 200, ToolBuildNavmesh(new Dictionary<string, object>())));
+                    return true;
+
+                case "/navigation/query":
+                    WriteJson(response, 200, ToolQueryNavpath(QueryToArgs(query, "fromX:startX", "fromY:startY", "fromZ:startZ", "toX:endX", "toY:endY", "toZ:endZ")));
+                    return true;
+
+                case "/navigation/info":
+                    WriteJson(response, 200, ToolGetNavigationInfo(new Dictionary<string, object>()));
+                    return true;
+
+                // -- Rendering --
+                case "/rendering/screenshot":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<ScreenshotRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null && !string.IsNullOrEmpty(data.OutputPath))
+                            args["outputPath"] = data.OutputPath;
+                        var result = ToolTakeScreenshot(args);
+                        var status = result.Contains("\"error\"") ? 500 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/rendering/settings":
+                    if (method == "POST")
+                        WriteJson(response, 200, ToolSetRenderingSettings(new Dictionary<string, object>()));
+                    else
+                        WriteJson(response, 200, ToolGetRenderingSettings(new Dictionary<string, object>()));
+                    return true;
+
+                // -- Audio --
+                case "/audio/play":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<AudioPlayRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (!string.IsNullOrEmpty(data.Clip)) args["clip"] = data.Clip;
+                            if (data.PositionX.HasValue) args["positionX"] = (double)data.PositionX.Value;
+                            if (data.PositionY.HasValue) args["positionY"] = (double)data.PositionY.Value;
+                            if (data.PositionZ.HasValue) args["positionZ"] = (double)data.PositionZ.Value;
+                            args["loop"] = data.Loop;
+                        }
+                        var result = ToolPlayAudio(args);
+                        var status = result.Contains("\"error\"") ? 400 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/audio/sources":
+                    WriteJson(response, 200, ToolListAudioSources(new Dictionary<string, object>()));
+                    return true;
+
+                // -- Prefabs --
+                case "/prefabs/spawn":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<PrefabSpawnRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (!string.IsNullOrEmpty(data.Prefab)) args["prefab"] = data.Prefab;
+                            if (!string.IsNullOrEmpty(data.Name)) args["name"] = data.Name;
+                            if (!string.IsNullOrEmpty(data.Parent)) args["parent"] = data.Parent;
+                            if (data.PositionX.HasValue) args["positionX"] = (double)data.PositionX.Value;
+                            if (data.PositionY.HasValue) args["positionY"] = (double)data.PositionY.Value;
+                            if (data.PositionZ.HasValue) args["positionZ"] = (double)data.PositionZ.Value;
+                            if (data.RotationX.HasValue) args["rotationX"] = (double)data.RotationX.Value;
+                            if (data.RotationY.HasValue) args["rotationY"] = (double)data.RotationY.Value;
+                            if (data.RotationZ.HasValue) args["rotationZ"] = (double)data.RotationZ.Value;
+                        }
+                        var result = ToolSpawnPrefab(args);
+                        var status = result.Contains("\"error\"") ? 400 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/prefabs/list":
+                    WriteJson(response, 200, ToolListPrefabs(new Dictionary<string, object>()));
+                    return true;
+
+                // -- Scene Management --
+                case "/scene/create":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<SceneCreateRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (!string.IsNullOrEmpty(data.Name)) args["name"] = data.Name;
+                            if (!string.IsNullOrEmpty(data.Path)) args["path"] = data.Path;
+                        }
+                        var result = ToolCreateScene(args);
+                        var status = result.Contains("\"error\"") ? 500 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/scene/save":
+                    RequirePost(method, response, () =>
+                    {
+                        var result = ToolSaveScene(new Dictionary<string, object>());
+                        var status = result.Contains("\"error\"") ? 500 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/scene/load":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<SceneLoadRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null && !string.IsNullOrEmpty(data.Path))
+                            args["path"] = data.Path;
+                        var result = ToolLoadScene(args);
+                        var status = result.Contains("\"error\"") ? 400 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/scene/list":
+                    WriteJson(response, 200, ToolGetSceneList(new Dictionary<string, object>()));
+                    return true;
+
+                case "/scene/actor/create":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<ActorCreateRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (!string.IsNullOrEmpty(data.Type)) args["type"] = data.Type;
+                            if (!string.IsNullOrEmpty(data.Name)) args["name"] = data.Name;
+                            if (!string.IsNullOrEmpty(data.Parent)) args["parent"] = data.Parent;
+                            if (!string.IsNullOrEmpty(data.Model)) args["model"] = data.Model;
+                            if (data.PositionX.HasValue) args["positionX"] = (double)data.PositionX.Value;
+                            if (data.PositionY.HasValue) args["positionY"] = (double)data.PositionY.Value;
+                            if (data.PositionZ.HasValue) args["positionZ"] = (double)data.PositionZ.Value;
+                            if (data.RotationX.HasValue) args["rotationX"] = (double)data.RotationX.Value;
+                            if (data.RotationY.HasValue) args["rotationY"] = (double)data.RotationY.Value;
+                            if (data.RotationZ.HasValue) args["rotationZ"] = (double)data.RotationZ.Value;
+                        }
+                        var result = ToolCreateActor(args);
+                        var status = result.Contains("\"error\"") ? 400 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/scene/actor/delete":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<ActorDeleteRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (!string.IsNullOrEmpty(data.Name)) args["name"] = data.Name;
+                            if (!string.IsNullOrEmpty(data.Id)) args["id"] = data.Id;
+                        }
+                        var result = ToolDeleteActor(args);
+                        var status = result.Contains("\"error\"") ? 404 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/scene/actor/reparent":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<ActorReparentRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (!string.IsNullOrEmpty(data.Actor)) args["actor"] = data.Actor;
+                            if (!string.IsNullOrEmpty(data.ActorId)) args["actorId"] = data.ActorId;
+                            if (!string.IsNullOrEmpty(data.NewParent)) args["newParent"] = data.NewParent;
+                            if (!string.IsNullOrEmpty(data.NewParentId)) args["newParentId"] = data.NewParentId;
+                        }
+                        var result = ToolReparentActor(args);
+                        var status = result.Contains("\"error\"") ? 404 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                // -- Content Database --
+                case "/content/search":
+                    WriteJson(response, 200, ToolSearchContent(QueryToArgs(query, "query", "type")));
+                    return true;
+
+                case "/content/reimport":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<ContentReimportRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null && !string.IsNullOrEmpty(data.Path))
+                            args["path"] = data.Path;
+                        var result = ToolReimportContent(args);
+                        var status = result.Contains("\"error\"") ? 400 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/content/info":
+                    WriteJson(response, 200, ToolGetContentInfo(QueryToArgs(query, "path")));
+                    return true;
+
+                // -- Build / Export --
+                case "/build/game":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<BuildGameRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (!string.IsNullOrEmpty(data.Platform)) args["platform"] = data.Platform;
+                            if (!string.IsNullOrEmpty(data.Configuration)) args["configuration"] = data.Configuration;
+                        }
+                        var result = ToolBuildGame(args);
+                        var status = result.Contains("\"error\"") ? 500 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/build/status":
+                    WriteJson(response, 200, ToolGetBuildStatus(new Dictionary<string, object>()));
+                    return true;
+
+                // -- Editor State --
+                case "/editor/state":
+                    WriteJson(response, 200, ToolGetEditorState(new Dictionary<string, object>()));
+                    return true;
+
+                case "/editor/select":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<EditorSelectRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (!string.IsNullOrEmpty(data.Name)) args["name"] = data.Name;
+                            if (!string.IsNullOrEmpty(data.Id)) args["id"] = data.Id;
+                        }
+                        var result = ToolEditorSelect(args);
+                        var status = result.Contains("\"error\"") ? 404 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/editor/focus":
+                    RequirePost(method, response, () =>
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<EditorFocusRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (!string.IsNullOrEmpty(data.Name)) args["name"] = data.Name;
+                            if (!string.IsNullOrEmpty(data.Id)) args["id"] = data.Id;
+                        }
+                        var result = ToolEditorFocus(args);
+                        var status = result.Contains("\"error\"") ? 404 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/editor/viewport":
+                    if (method == "POST")
+                    {
+                        var body = ReadRequestBody(context.Request);
+                        var data = FlaxEngine.Json.JsonSerializer.Deserialize<ViewportSetRestRequest>(body);
+                        var args = new Dictionary<string, object>();
+                        if (data != null)
+                        {
+                            if (data.PositionX.HasValue) args["positionX"] = (double)data.PositionX.Value;
+                            if (data.PositionY.HasValue) args["positionY"] = (double)data.PositionY.Value;
+                            if (data.PositionZ.HasValue) args["positionZ"] = (double)data.PositionZ.Value;
+                            if (data.Yaw.HasValue) args["yaw"] = (double)data.Yaw.Value;
+                            if (data.Pitch.HasValue) args["pitch"] = (double)data.Pitch.Value;
+                        }
+                        WriteJson(response, 200, ToolSetViewport(args));
+                    }
+                    else
+                    {
+                        WriteJson(response, 200, ToolGetViewport(new Dictionary<string, object>()));
+                    }
+                    return true;
+
+                // -- Scripting --
+                case "/scripts/list":
+                    WriteJson(response, 200, ToolListScripts(new Dictionary<string, object>()));
+                    return true;
+
+                case "/scripts/compile":
+                    RequirePost(method, response, () =>
+                    {
+                        var result = ToolCompileScripts(new Dictionary<string, object>());
+                        var status = result.Contains("\"error\"") ? 500 : 200;
+                        WriteJson(response, status, result);
+                    });
+                    return true;
+
+                case "/scripts/errors":
+                    WriteJson(response, 200, ToolGetScriptErrors(new Dictionary<string, object>()));
+                    return true;
+
+                default:
+                    return false;
             }
         }
 
+        // ------------------------------------------------------------------
+        // REST query-string to tool-args converter
+        // ------------------------------------------------------------------
+
         /// <summary>
-        /// Searches content items by name query and/or type filter.
+        /// Converts query-string parameters to a tool argument dictionary.
+        /// Supports renaming via "queryKey:toolKey" syntax (e.g. "dirX:directionX").
         /// </summary>
-        private void SearchContentItems(ContentFolder folder, string nameQuery, string typeFilter, List<string> results)
+        private static Dictionary<string, object> QueryToArgs(NameValueCollection query, params string[] keys)
         {
-            if (folder == null)
-                return;
-
-            foreach (var child in folder.Children)
+            var args = new Dictionary<string, object>();
+            foreach (var key in keys)
             {
-                if (child is ContentFolder childFolder)
+                string queryKey, toolKey;
+                var colonIdx = key.IndexOf(':');
+                if (colonIdx >= 0)
                 {
-                    SearchContentItems(childFolder, nameQuery, typeFilter, results);
+                    queryKey = key.Substring(0, colonIdx);
+                    toolKey = key.Substring(colonIdx + 1);
                 }
-                else if (child is AssetItem assetItem)
+                else
                 {
-                    bool nameMatch = string.IsNullOrEmpty(nameQuery) ||
-                        (child.ShortName != null && child.ShortName.IndexOf(nameQuery, StringComparison.OrdinalIgnoreCase) >= 0);
-
-                    bool typeMatch = string.IsNullOrEmpty(typeFilter) ||
-                        assetItem.TypeName.IndexOf(typeFilter, StringComparison.OrdinalIgnoreCase) >= 0;
-
-                    if (nameMatch && typeMatch)
-                    {
-                        results.Add(BuildJsonObject(
-                            "name", child.ShortName,
-                            "type", assetItem.TypeName,
-                            "path", child.Path,
-                            "id", assetItem.ID.ToString()
-                        ));
-                    }
+                    queryKey = key;
+                    toolKey = key;
                 }
+
+                var val = query[queryKey];
+                if (val != null)
+                    args[toolKey] = val;
             }
+            return args;
         }
 
         // ==================================================================
-        // Extension request data classes
+        // REST request data classes (backward compatibility)
         // ==================================================================
 
         [Serializable]
-        private class PhysicsSettingsRequest
+        private class PhysicsSettingsRestRequest
         {
             public float? GravityX;
             public float? GravityY;
@@ -2311,7 +3112,7 @@ namespace FlaxMCP
         }
 
         [Serializable]
-        private class AnimationPlayRequest
+        private class AnimationPlayRestRequest
         {
             public string Actor;
             public string Clip;
@@ -2321,7 +3122,7 @@ namespace FlaxMCP
         }
 
         [Serializable]
-        private class TerrainSculptRequest
+        private class TerrainSculptRestRequest
         {
             public float X;
             public float Z;
@@ -2331,21 +3132,13 @@ namespace FlaxMCP
         }
 
         [Serializable]
-        private class ScreenshotRequest
+        private class ScreenshotRestRequest
         {
             public string OutputPath;
-            public int Width = 1920;
-            public int Height = 1080;
         }
 
         [Serializable]
-        private class RenderingSettingsRequest
-        {
-            public bool? HalfResolution;
-        }
-
-        [Serializable]
-        private class AudioPlayRequest
+        private class AudioPlayRestRequest
         {
             public string Clip;
             public float? PositionX;
@@ -2355,7 +3148,7 @@ namespace FlaxMCP
         }
 
         [Serializable]
-        private class PrefabSpawnRequest
+        private class PrefabSpawnRestRequest
         {
             public string Prefab;
             public string Name;
@@ -2369,20 +3162,20 @@ namespace FlaxMCP
         }
 
         [Serializable]
-        private class SceneCreateRequest
+        private class SceneCreateRestRequest
         {
             public string Name;
             public string Path;
         }
 
         [Serializable]
-        private class SceneLoadRequest
+        private class SceneLoadRestRequest
         {
             public string Path;
         }
 
         [Serializable]
-        private class ActorCreateRequest
+        private class ActorCreateRestRequest
         {
             public string Type;
             public string Name;
@@ -2397,14 +3190,14 @@ namespace FlaxMCP
         }
 
         [Serializable]
-        private class ActorDeleteRequest
+        private class ActorDeleteRestRequest
         {
             public string Name;
             public string Id;
         }
 
         [Serializable]
-        private class ActorReparentRequest
+        private class ActorReparentRestRequest
         {
             public string Actor;
             public string ActorId;
@@ -2413,34 +3206,34 @@ namespace FlaxMCP
         }
 
         [Serializable]
-        private class ContentReimportRequest
+        private class ContentReimportRestRequest
         {
             public string Path;
         }
 
         [Serializable]
-        private class BuildGameRequest
+        private class BuildGameRestRequest
         {
             public string Platform;
             public string Configuration;
         }
 
         [Serializable]
-        private class EditorSelectRequest
+        private class EditorSelectRestRequest
         {
             public string Name;
             public string Id;
         }
 
         [Serializable]
-        private class EditorFocusRequest
+        private class EditorFocusRestRequest
         {
             public string Name;
             public string Id;
         }
 
         [Serializable]
-        private class ViewportSetRequest
+        private class ViewportSetRestRequest
         {
             public float? PositionX;
             public float? PositionY;

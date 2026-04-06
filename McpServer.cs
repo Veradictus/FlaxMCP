@@ -9,14 +9,16 @@ using System.Threading;
 using FlaxEditor;
 using FlaxEditor.Content;
 using FlaxEngine;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace FlaxMCP
 {
     /// <summary>
-    /// Lightweight HTTP server that exposes Flax Editor functionality over a
-    /// REST-like API on localhost. Designed for MCP-compatible external tools
-    /// (such as Claude Code) to inspect scenes, modify actors, import assets,
-    /// and control the editor programmatically.
+    /// MCP (Model Context Protocol) server for Flax Editor. Exposes engine
+    /// functionality via the MCP Streamable HTTP transport on <c>/mcp</c>
+    /// (JSON-RPC 2.0) and retains backward-compatible REST endpoints on the
+    /// original paths.
     ///
     /// The server runs on a background thread using <see cref="HttpListener"/>
     /// and marshals all Flax API calls back to the main thread via
@@ -28,6 +30,9 @@ namespace FlaxMCP
     {
         private const string Prefix = "http://localhost:9100/";
         private const int MaxLogEntries = 500;
+        private const string ServerName = "FlaxMCP";
+        private const string ServerVersion = "2.0.0";
+        private const string ProtocolVersion = "2025-03-26";
 
         private HttpListener _listener;
         private Thread _listenerThread;
@@ -36,6 +41,24 @@ namespace FlaxMCP
         // Circular buffer for captured log entries
         private readonly List<LogEntry> _logBuffer = new List<LogEntry>();
         private readonly object _logLock = new object();
+
+        // MCP tool registry
+        private readonly Dictionary<string, McpTool> _tools = new Dictionary<string, McpTool>();
+
+        // Build status tracking
+        private volatile string _buildStatus = "idle";
+
+        // ------------------------------------------------------------------
+        // MCP tool definition
+        // ------------------------------------------------------------------
+
+        private class McpTool
+        {
+            public string Name;
+            public string Description;
+            public string InputSchemaJson;
+            public Func<Dictionary<string, object>, string> Handler;
+        }
 
         // ------------------------------------------------------------------
         // Lifecycle
@@ -51,12 +74,13 @@ namespace FlaxMCP
 
             try
             {
+                RegisterAllTools();
+
                 _listener = new HttpListener();
                 _listener.Prefixes.Add(Prefix);
                 _listener.Start();
                 _running = true;
 
-                // Subscribe to engine log output
                 Debug.Logger.LogHandler.SendLog += OnLogMessage;
                 Debug.Logger.LogHandler.SendExceptionLog += OnExceptionLog;
 
@@ -67,7 +91,7 @@ namespace FlaxMCP
                 };
                 _listenerThread.Start();
 
-                Debug.Log($"[McpServer] Started on {Prefix}");
+                Debug.Log($"[McpServer] Started on {Prefix} ({_tools.Count} tools registered)");
             }
             catch (Exception ex)
             {
@@ -131,7 +155,6 @@ namespace FlaxMCP
                 }
                 catch (HttpListenerException)
                 {
-                    // Expected when listener is stopped
                     break;
                 }
                 catch (ObjectDisposedException)
@@ -156,7 +179,7 @@ namespace FlaxMCP
 
             try
             {
-                // CORS headers for browser-based tools
+                // CORS headers for browser-based MCP clients
                 response.Headers.Add("Access-Control-Allow-Origin", "*");
                 response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
                 response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
@@ -171,75 +194,15 @@ namespace FlaxMCP
                 var path = context.Request.Url.AbsolutePath.TrimEnd('/');
                 var query = context.Request.QueryString;
 
-                // Route to handler
-                switch (path)
+                // MCP Streamable HTTP transport endpoint
+                if (path == "/mcp")
                 {
-                    case "/health":
-                        HandleHealth(response);
-                        break;
-
-                    case "/assets/list":
-                        HandleAssetsList(response, query);
-                        break;
-
-                    case "/assets/import":
-                        RequirePost(method, response, () => HandleAssetsImport(context, response));
-                        break;
-
-                    case "/materials/create":
-                        RequirePost(method, response, () => HandleMaterialCreate(context, response));
-                        break;
-
-                    case "/materials/create-instance":
-                        RequirePost(method, response, () => HandleMaterialInstanceCreate(context, response));
-                        break;
-
-                    case "/scene/hierarchy":
-                        HandleSceneHierarchy(response);
-                        break;
-
-                    case "/scene/actor":
-                        HandleSceneActor(response, query);
-                        break;
-
-                    case "/scene/actor/property":
-                        RequirePost(method, response, () => HandleSetActorProperty(context, response));
-                        break;
-
-                    case "/scene/find":
-                        HandleFindActors(response, query);
-                        break;
-
-                    case "/editor/logs":
-                        HandleEditorLogs(response, query);
-                        break;
-
-                    case "/editor/play":
-                        RequirePost(method, response, () => HandleEditorPlay(response));
-                        break;
-
-                    case "/editor/stop":
-                        RequirePost(method, response, () => HandleEditorStop(response));
-                        break;
-
-                    case "/content/find":
-                        HandleContentFind(response, query);
-                        break;
-
-                    case "/scripts/read":
-                        HandleScriptRead(response, query);
-                        break;
-
-                    default:
-                        if (!HandleExtensionRoute(path, method, context, response, query))
-                        {
-                            WriteJson(response, 404, BuildJsonObject(
-                                "error", "Not found",
-                                "path", path
-                            ));
-                        }
-                        break;
+                    HandleMcpRequest(context, response);
+                    return;
                 }
+
+                // Legacy REST dispatch for backward compatibility
+                HandleLegacyRestRequest(method, path, context, response, query);
             }
             catch (Exception ex)
             {
@@ -268,6 +231,343 @@ namespace FlaxMCP
             }
         }
 
+        // ------------------------------------------------------------------
+        // MCP Protocol handler (JSON-RPC 2.0 over HTTP)
+        // ------------------------------------------------------------------
+
+        private void HandleMcpRequest(HttpListenerContext context, HttpListenerResponse response)
+        {
+            if (context.Request.HttpMethod != "POST")
+            {
+                WriteJson(response, 405, BuildJsonRpcError(null, -32600, "MCP endpoint requires POST."));
+                return;
+            }
+
+            var body = ReadRequestBody(context.Request);
+
+            JObject request;
+            try
+            {
+                request = JObject.Parse(body);
+            }
+            catch (Exception)
+            {
+                WriteJson(response, 400, BuildJsonRpcError(null, -32700, "Parse error: invalid JSON."));
+                return;
+            }
+
+            var jsonrpc = request["jsonrpc"]?.ToString();
+            if (jsonrpc != "2.0")
+            {
+                WriteJson(response, 400, BuildJsonRpcError(null, -32600, "Invalid request: jsonrpc must be \"2.0\"."));
+                return;
+            }
+
+            var rpcMethod = request["method"]?.ToString();
+            var id = request["id"];
+            var rpcParams = request["params"] as JObject;
+
+            // Notifications have no id and require no response
+            if (id == null)
+            {
+                // Handle known notifications silently
+                if (rpcMethod == "notifications/initialized" ||
+                    rpcMethod == "notifications/cancelled")
+                {
+                    WriteJson(response, 204, "");
+                    return;
+                }
+
+                // Unknown notification -- still no response
+                WriteJson(response, 204, "");
+                return;
+            }
+
+            // Route JSON-RPC methods
+            string result;
+            switch (rpcMethod)
+            {
+                case "initialize":
+                    result = HandleMcpInitialize(id);
+                    break;
+
+                case "tools/list":
+                    result = HandleMcpToolsList(id);
+                    break;
+
+                case "tools/call":
+                    result = HandleMcpToolsCall(id, rpcParams);
+                    break;
+
+                case "ping":
+                    result = BuildJsonRpcResult(id, new JObject());
+                    break;
+
+                default:
+                    result = BuildJsonRpcError(id, -32601, $"Method not found: {rpcMethod}");
+                    break;
+            }
+
+            WriteJson(response, 200, result);
+        }
+
+        private string HandleMcpInitialize(JToken id)
+        {
+            var resultObj = new JObject
+            {
+                ["protocolVersion"] = ProtocolVersion,
+                ["capabilities"] = new JObject
+                {
+                    ["tools"] = new JObject
+                    {
+                        ["listChanged"] = false
+                    }
+                },
+                ["serverInfo"] = new JObject
+                {
+                    ["name"] = ServerName,
+                    ["version"] = ServerVersion
+                }
+            };
+
+            return BuildJsonRpcResult(id, resultObj);
+        }
+
+        private string HandleMcpToolsList(JToken id)
+        {
+            var toolsArray = new JArray();
+
+            foreach (var kvp in _tools)
+            {
+                var tool = kvp.Value;
+                var toolObj = new JObject
+                {
+                    ["name"] = tool.Name,
+                    ["description"] = tool.Description,
+                    ["inputSchema"] = JObject.Parse(tool.InputSchemaJson)
+                };
+                toolsArray.Add(toolObj);
+            }
+
+            var resultObj = new JObject
+            {
+                ["tools"] = toolsArray
+            };
+
+            return BuildJsonRpcResult(id, resultObj);
+        }
+
+        private string HandleMcpToolsCall(JToken id, JObject rpcParams)
+        {
+            if (rpcParams == null)
+                return BuildJsonRpcError(id, -32602, "Invalid params: missing params object.");
+
+            var toolName = rpcParams["name"]?.ToString();
+            if (string.IsNullOrEmpty(toolName))
+                return BuildJsonRpcError(id, -32602, "Invalid params: missing 'name'.");
+
+            if (!_tools.TryGetValue(toolName, out var tool))
+                return BuildJsonRpcError(id, -32602, $"Unknown tool: {toolName}");
+
+            // Convert JObject arguments to Dictionary<string, object>
+            var args = new Dictionary<string, object>();
+            var argsToken = rpcParams["arguments"] as JObject;
+            if (argsToken != null)
+            {
+                foreach (var prop in argsToken.Properties())
+                {
+                    args[prop.Name] = ConvertJToken(prop.Value);
+                }
+            }
+
+            try
+            {
+                var toolResult = tool.Handler(args);
+
+                var contentArray = new JArray
+                {
+                    new JObject
+                    {
+                        ["type"] = "text",
+                        ["text"] = toolResult
+                    }
+                };
+
+                var resultObj = new JObject
+                {
+                    ["content"] = contentArray
+                };
+
+                return BuildJsonRpcResult(id, resultObj);
+            }
+            catch (Exception ex)
+            {
+                return BuildJsonRpcError(id, -1, $"Tool '{toolName}' failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Converts a <see cref="JToken"/> to a plain CLR object for use
+        /// by tool handlers.
+        /// </summary>
+        private object ConvertJToken(JToken token)
+        {
+            switch (token.Type)
+            {
+                case JTokenType.Object:
+                    var dict = new Dictionary<string, object>();
+                    foreach (var prop in ((JObject)token).Properties())
+                        dict[prop.Name] = ConvertJToken(prop.Value);
+                    return dict;
+
+                case JTokenType.Array:
+                    var list = new List<object>();
+                    foreach (var item in (JArray)token)
+                        list.Add(ConvertJToken(item));
+                    return list;
+
+                case JTokenType.Integer:
+                    return token.Value<long>();
+
+                case JTokenType.Float:
+                    return token.Value<double>();
+
+                case JTokenType.Boolean:
+                    return token.Value<bool>();
+
+                case JTokenType.String:
+                    return token.Value<string>();
+
+                case JTokenType.Null:
+                case JTokenType.Undefined:
+                    return null;
+
+                default:
+                    return token.ToString();
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // JSON-RPC response builders
+        // ------------------------------------------------------------------
+
+        private static string BuildJsonRpcResult(JToken id, JToken result)
+        {
+            var obj = new JObject
+            {
+                ["jsonrpc"] = "2.0",
+                ["id"] = id?.DeepClone(),
+                ["result"] = result
+            };
+            return obj.ToString(Formatting.None);
+        }
+
+        private static string BuildJsonRpcError(JToken id, int code, string message)
+        {
+            var obj = new JObject
+            {
+                ["jsonrpc"] = "2.0",
+                ["id"] = id?.DeepClone(),
+                ["error"] = new JObject
+                {
+                    ["code"] = code,
+                    ["message"] = message
+                }
+            };
+            return obj.ToString(Formatting.None);
+        }
+
+        // ------------------------------------------------------------------
+        // Tool registration
+        // ------------------------------------------------------------------
+
+        private void RegisterTool(string name, string description, string inputSchemaJson, Func<Dictionary<string, object>, string> handler)
+        {
+            _tools[name] = new McpTool
+            {
+                Name = name,
+                Description = description,
+                InputSchemaJson = inputSchemaJson,
+                Handler = handler
+            };
+        }
+
+        // ------------------------------------------------------------------
+        // Legacy REST dispatch (backward compatibility)
+        // ------------------------------------------------------------------
+
+        private void HandleLegacyRestRequest(string method, string path, HttpListenerContext context, HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
+        {
+            switch (path)
+            {
+                case "/health":
+                    HandleRestHealth(response);
+                    break;
+
+                case "/assets/list":
+                    HandleRestAssetsList(response, query);
+                    break;
+
+                case "/assets/import":
+                    RequirePost(method, response, () => HandleRestAssetsImport(context, response));
+                    break;
+
+                case "/materials/create":
+                    RequirePost(method, response, () => HandleRestMaterialCreate(context, response));
+                    break;
+
+                case "/materials/create-instance":
+                    RequirePost(method, response, () => HandleRestMaterialInstanceCreate(context, response));
+                    break;
+
+                case "/scene/hierarchy":
+                    HandleRestSceneHierarchy(response);
+                    break;
+
+                case "/scene/actor":
+                    HandleRestSceneActor(response, query);
+                    break;
+
+                case "/scene/actor/property":
+                    RequirePost(method, response, () => HandleRestSetActorProperty(context, response));
+                    break;
+
+                case "/scene/find":
+                    HandleRestFindActors(response, query);
+                    break;
+
+                case "/editor/logs":
+                    HandleRestEditorLogs(response, query);
+                    break;
+
+                case "/editor/play":
+                    RequirePost(method, response, () => HandleRestEditorPlay(response));
+                    break;
+
+                case "/editor/stop":
+                    RequirePost(method, response, () => HandleRestEditorStop(response));
+                    break;
+
+                case "/content/find":
+                    HandleRestContentFind(response, query);
+                    break;
+
+                case "/scripts/read":
+                    HandleRestScriptRead(response, query);
+                    break;
+
+                default:
+                    if (!HandleExtensionRoute(path, method, context, response, query))
+                    {
+                        WriteJson(response, 404, BuildJsonObject(
+                            "error", "Not found",
+                            "path", path
+                        ));
+                    }
+                    break;
+            }
+        }
+
         private void RequirePost(string method, HttpListenerResponse response, Action handler)
         {
             if (method != "POST")
@@ -280,10 +580,10 @@ namespace FlaxMCP
         }
 
         // ------------------------------------------------------------------
-        // GET /health
+        // REST: GET /health
         // ------------------------------------------------------------------
 
-        private void HandleHealth(HttpListenerResponse response)
+        private void HandleRestHealth(HttpListenerResponse response)
         {
             var result = InvokeOnMainThread(() =>
             {
@@ -300,84 +600,22 @@ namespace FlaxMCP
         }
 
         // ------------------------------------------------------------------
-        // GET /assets/list?path=Content/Imports&type=fbx
+        // REST: GET /assets/list
         // ------------------------------------------------------------------
 
-        private void HandleAssetsList(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
+        private void HandleRestAssetsList(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
         {
-            var path = query["path"] ?? "Content";
-            var typeFilter = query["type"];
-
-            var result = InvokeOnMainThread(() =>
-            {
-                var item = Editor.Instance.ContentDatabase.Find(path);
-                if (item == null)
-                    return BuildJsonObject("error", $"Path not found: {path}");
-
-                var folder = item as ContentFolder;
-                if (folder == null)
-                    return BuildJsonObject("error", $"Path is not a folder: {path}");
-
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                sb.AppendLine($"  \"path\": {JsonEscape(path)},");
-                sb.AppendLine("  \"items\": [");
-
-                var items = new List<string>();
-
-                // List child folders
-                foreach (var child in folder.Children)
-                {
-                    if (child is ContentFolder childFolder)
-                    {
-                        items.Add(BuildJsonObject(
-                            "name", childFolder.ShortName,
-                            "type", "Folder",
-                            "path", childFolder.Path
-                        ));
-                    }
-                    else
-                    {
-                        var ext = Path.GetExtension(child.FileName)?.TrimStart('.').ToLowerInvariant() ?? "";
-                        if (typeFilter != null && !string.Equals(ext, typeFilter, StringComparison.OrdinalIgnoreCase))
-                            continue;
-
-                        var idStr = "";
-                        if (child is AssetItem assetItem)
-                            idStr = assetItem.ID.ToString();
-
-                        items.Add(BuildJsonObject(
-                            "name", child.ShortName,
-                            "type", child.GetType().Name,
-                            "path", child.Path,
-                            "id", idStr
-                        ));
-                    }
-                }
-
-                for (int i = 0; i < items.Count; i++)
-                {
-                    sb.Append("    ");
-                    sb.Append(items[i]);
-                    if (i < items.Count - 1)
-                        sb.Append(",");
-                    sb.AppendLine();
-                }
-
-                sb.AppendLine("  ]");
-                sb.Append("}");
-                return sb.ToString();
-            });
-
-            var statusCode = result.Contains("\"error\"") ? 404 : 200;
-            WriteJson(response, statusCode, result);
+            var args = new Dictionary<string, object>();
+            if (query["path"] != null) args["path"] = query["path"];
+            if (query["type"] != null) args["type"] = query["type"];
+            WriteJson(response, 200, ToolListAssets(args));
         }
 
         // ------------------------------------------------------------------
-        // POST /assets/import
+        // REST: POST /assets/import
         // ------------------------------------------------------------------
 
-        private void HandleAssetsImport(HttpListenerContext context, HttpListenerResponse response)
+        private void HandleRestAssetsImport(HttpListenerContext context, HttpListenerResponse response)
         {
             var body = ReadRequestBody(context.Request);
             var data = FlaxEngine.Json.JsonSerializer.Deserialize<ImportRequest>(body);
@@ -388,42 +626,18 @@ namespace FlaxMCP
                 return;
             }
 
-            var target = data.Target ?? "Content";
-            var skipDialog = data.SkipDialog;
-
-            var result = InvokeOnMainThread(() =>
-            {
-                var folder = Editor.Instance.ContentDatabase.Find(target) as ContentFolder;
-                if (folder == null)
-                    return BuildJsonObject("error", $"Target folder not found: {target}");
-
-                int queued = 0;
-                foreach (var file in data.Files)
-                {
-                    if (!File.Exists(file))
-                    {
-                        Debug.LogWarning($"[McpServer] Import file not found: {file}");
-                        continue;
-                    }
-
-                    Editor.Instance.ContentImporting.Import(file, folder, skipDialog);
-                    queued++;
-                }
-
-                return BuildJsonObject(
-                    "imported", queued.ToString(),
-                    "target", target
-                );
-            });
-
-            WriteJson(response, 200, result);
+            var args = new Dictionary<string, object>();
+            args["files"] = new List<object>(data.Files);
+            args["target"] = data.Target ?? "Content";
+            args["skipDialog"] = data.SkipDialog;
+            WriteJson(response, 200, ToolImportAssets(args));
         }
 
         // ------------------------------------------------------------------
-        // POST /materials/create
+        // REST: POST /materials/create
         // ------------------------------------------------------------------
 
-        private void HandleMaterialCreate(HttpListenerContext context, HttpListenerResponse response)
+        private void HandleRestMaterialCreate(HttpListenerContext context, HttpListenerResponse response)
         {
             var body = ReadRequestBody(context.Request);
             var data = FlaxEngine.Json.JsonSerializer.Deserialize<MaterialCreateRequest>(body);
@@ -434,32 +648,22 @@ namespace FlaxMCP
                 return;
             }
 
-            var result = InvokeOnMainThread(() =>
+            var args = new Dictionary<string, object>
             {
-                var absPath = Path.Combine(Globals.ProjectFolder, data.OutputPath);
-                var dir = Path.GetDirectoryName(absPath);
-                if (dir != null)
-                    Directory.CreateDirectory(dir);
+                ["name"] = data.Name,
+                ["outputPath"] = data.OutputPath
+            };
 
-                if (FlaxEditor.Editor.CreateAsset("Material", absPath))
-                    return BuildJsonObject("error", $"Failed to create material at: {data.OutputPath}");
-
-                return BuildJsonObject(
-                    "created", "true",
-                    "name", data.Name,
-                    "path", data.OutputPath
-                );
-            });
-
+            var result = ToolCreateMaterial(args);
             var statusCode = result.Contains("\"error\"") ? 500 : 200;
             WriteJson(response, statusCode, result);
         }
 
         // ------------------------------------------------------------------
-        // POST /materials/create-instance
+        // REST: POST /materials/create-instance
         // ------------------------------------------------------------------
 
-        private void HandleMaterialInstanceCreate(HttpListenerContext context, HttpListenerResponse response)
+        private void HandleRestMaterialInstanceCreate(HttpListenerContext context, HttpListenerResponse response)
         {
             var body = ReadRequestBody(context.Request);
             var data = FlaxEngine.Json.JsonSerializer.Deserialize<MaterialInstanceCreateRequest>(body);
@@ -470,260 +674,56 @@ namespace FlaxMCP
                 return;
             }
 
-            var result = InvokeOnMainThread(() =>
+            var args = new Dictionary<string, object>
             {
-                var absPath = Path.Combine(Globals.ProjectFolder, data.OutputPath);
-                var dir = Path.GetDirectoryName(absPath);
-                if (dir != null)
-                    Directory.CreateDirectory(dir);
+                ["name"] = data.Name,
+                ["outputPath"] = data.OutputPath
+            };
+            if (!string.IsNullOrEmpty(data.BaseMaterial))
+                args["baseMaterial"] = data.BaseMaterial;
+            if (data.Parameters != null)
+                args["parameters"] = data.Parameters;
 
-                if (FlaxEditor.Editor.CreateAsset("MaterialInstance", absPath))
-                    return BuildJsonObject("error", $"Failed to create material instance at: {data.OutputPath}");
-
-                var instance = FlaxEngine.Content.Load<MaterialInstance>(data.OutputPath);
-                if (instance == null)
-                    return BuildJsonObject("error", $"Failed to load created material instance: {data.OutputPath}");
-
-                // Set base material if specified
-                if (!string.IsNullOrEmpty(data.BaseMaterial))
-                {
-                    var baseMat = FlaxEngine.Content.Load<MaterialBase>(data.BaseMaterial);
-                    if (baseMat != null)
-                        instance.BaseMaterial = baseMat;
-                    else
-                        Debug.LogWarning($"[McpServer] Base material not found: {data.BaseMaterial}");
-                }
-
-                // Set parameters if specified
-                if (data.Parameters != null)
-                {
-                    foreach (var kvp in data.Parameters)
-                    {
-                        try
-                        {
-                            SetMaterialParameter(instance, kvp.Key, kvp.Value);
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.LogWarning($"[McpServer] Failed to set parameter '{kvp.Key}': {ex.Message}");
-                        }
-                    }
-                }
-
-                instance.Save();
-
-                return BuildJsonObject(
-                    "created", "true",
-                    "name", data.Name,
-                    "path", data.OutputPath
-                );
-            });
-
+            var result = ToolCreateMaterialInstance(args);
             var statusCode = result.Contains("\"error\"") ? 500 : 200;
             WriteJson(response, statusCode, result);
         }
 
-        private void SetMaterialParameter(MaterialInstance instance, string name, object value)
+        // ------------------------------------------------------------------
+        // REST: GET /scene/hierarchy
+        // ------------------------------------------------------------------
+
+        private void HandleRestSceneHierarchy(HttpListenerResponse response)
         {
-            if (value is double d)
-            {
-                instance.SetParameterValue(name, (float)d);
-            }
-            else if (value is long l)
-            {
-                instance.SetParameterValue(name, (float)l);
-            }
-            else if (value is string s)
-            {
-                // Assume string values are asset paths (textures)
-                var texture = FlaxEngine.Content.Load<Texture>(s);
-                if (texture != null)
-                    instance.SetParameterValue(name, texture);
-                else
-                    Debug.LogWarning($"[McpServer] Texture not found for parameter '{name}': {s}");
-            }
-            else if (value != null)
-            {
-                instance.SetParameterValue(name, value);
-            }
+            WriteJson(response, 200, ToolGetSceneHierarchy(new Dictionary<string, object>()));
         }
 
         // ------------------------------------------------------------------
-        // GET /scene/hierarchy
+        // REST: GET /scene/actor
         // ------------------------------------------------------------------
 
-        private void HandleSceneHierarchy(HttpListenerResponse response)
+        private void HandleRestSceneActor(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
         {
-            var result = InvokeOnMainThread(() =>
-            {
-                var scenes = Level.Scenes;
-                if (scenes == null || scenes.Length == 0)
-                    return BuildJsonObject("error", "No scenes loaded.");
+            var args = new Dictionary<string, object>();
+            if (query["name"] != null) args["name"] = query["name"];
+            if (query["id"] != null) args["id"] = query["id"];
 
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                sb.AppendLine("  \"scenes\": [");
-
-                for (int s = 0; s < scenes.Length; s++)
-                {
-                    var scene = scenes[s];
-                    sb.Append("    ");
-                    BuildActorJson(sb, scene, 2);
-                    if (s < scenes.Length - 1)
-                        sb.Append(",");
-                    sb.AppendLine();
-                }
-
-                sb.AppendLine("  ]");
-                sb.Append("}");
-                return sb.ToString();
-            });
-
-            WriteJson(response, 200, result);
-        }
-
-        private void BuildActorJson(StringBuilder sb, Actor actor, int indent)
-        {
-            var pad = new string(' ', indent * 2);
-            var innerPad = new string(' ', (indent + 1) * 2);
-
-            sb.AppendLine("{");
-            sb.AppendLine($"{innerPad}\"name\": {JsonEscape(actor.Name)},");
-            sb.AppendLine($"{innerPad}\"type\": {JsonEscape(actor.GetType().Name)},");
-            sb.AppendLine($"{innerPad}\"id\": {JsonEscape(actor.ID.ToString())},");
-            sb.AppendLine($"{innerPad}\"isActive\": {(actor.IsActive ? "true" : "false")},");
-
-            // Position
-            var pos = actor.Position;
-            sb.AppendLine($"{innerPad}\"position\": {{ \"X\": {pos.X}, \"Y\": {pos.Y}, \"Z\": {pos.Z} }},");
-
-            // Children
-            sb.AppendLine($"{innerPad}\"children\": [");
-            var children = actor.Children;
-            for (int i = 0; i < children.Length; i++)
-            {
-                sb.Append($"{innerPad}  ");
-                BuildActorJson(sb, children[i], indent + 2);
-                if (i < children.Length - 1)
-                    sb.Append(",");
-                sb.AppendLine();
-            }
-
-            sb.AppendLine($"{innerPad}]");
-            sb.Append($"{pad}}}");
-        }
-
-        // ------------------------------------------------------------------
-        // GET /scene/actor?name=MyActor or ?id=guid
-        // ------------------------------------------------------------------
-
-        private void HandleSceneActor(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
-        {
-            var name = query["name"];
-            var id = query["id"];
-
-            if (string.IsNullOrEmpty(name) && string.IsNullOrEmpty(id))
+            if (args.Count == 0)
             {
                 WriteJson(response, 400, BuildJsonObject("error", "Provide 'name' or 'id' query parameter."));
                 return;
             }
 
-            var result = InvokeOnMainThread(() =>
-            {
-                Actor actor = null;
-
-                if (!string.IsNullOrEmpty(id))
-                {
-                    if (Guid.TryParse(id, out var guid))
-                        actor = FlaxEngine.Object.Find<Actor>(ref guid);
-                }
-                else
-                {
-                    actor = FindActorByName(name);
-                }
-
-                if (actor == null)
-                    return BuildJsonObject("error", $"Actor not found: {name ?? id}");
-
-                return BuildActorDetailJson(actor);
-            });
-
+            var result = ToolGetActor(args);
             var statusCode = result.Contains("\"error\"") ? 404 : 200;
             WriteJson(response, statusCode, result);
         }
 
-        private string BuildActorDetailJson(Actor actor)
-        {
-            var sb = new StringBuilder();
-            sb.AppendLine("{");
-            sb.AppendLine($"  \"name\": {JsonEscape(actor.Name)},");
-            sb.AppendLine($"  \"type\": {JsonEscape(actor.GetType().Name)},");
-            sb.AppendLine($"  \"id\": {JsonEscape(actor.ID.ToString())},");
-            sb.AppendLine($"  \"isActive\": {(actor.IsActive ? "true" : "false")},");
-
-            // Full transform
-            var t = actor.Transform;
-            sb.AppendLine("  \"transform\": {");
-            sb.AppendLine($"    \"position\": {{ \"X\": {t.Translation.X}, \"Y\": {t.Translation.Y}, \"Z\": {t.Translation.Z} }},");
-            sb.AppendLine($"    \"rotation\": {{ \"X\": {t.Orientation.X}, \"Y\": {t.Orientation.Y}, \"Z\": {t.Orientation.Z}, \"W\": {t.Orientation.W} }},");
-            sb.AppendLine($"    \"scale\": {{ \"X\": {t.Scale.X}, \"Y\": {t.Scale.Y}, \"Z\": {t.Scale.Z} }}");
-            sb.AppendLine("  },");
-
-            // Tags
-            sb.Append("  \"tags\": [");
-            if (actor.Tags != null && actor.Tags.Length > 0)
-            {
-                for (int ti = 0; ti < actor.Tags.Length; ti++)
-                {
-                    sb.Append(JsonEscape(actor.Tags[ti].ToString()));
-                    if (ti < actor.Tags.Length - 1)
-                        sb.Append(", ");
-                }
-            }
-            sb.AppendLine("],");
-
-            // Scripts / components
-            sb.AppendLine("  \"scripts\": [");
-            var scripts = actor.Scripts;
-            for (int i = 0; i < scripts.Length; i++)
-            {
-                var script = scripts[i];
-                sb.AppendLine("    {");
-                sb.AppendLine($"      \"type\": {JsonEscape(script.GetType().FullName)},");
-                sb.AppendLine($"      \"enabled\": {(script.Enabled ? "true" : "false")},");
-                sb.AppendLine($"      \"id\": {JsonEscape(script.ID.ToString())}");
-                sb.Append("    }");
-                if (i < scripts.Length - 1)
-                    sb.Append(",");
-                sb.AppendLine();
-            }
-            sb.AppendLine("  ],");
-
-            // Children summary
-            sb.AppendLine("  \"children\": [");
-            var children = actor.Children;
-            for (int i = 0; i < children.Length; i++)
-            {
-                sb.AppendLine("    {");
-                sb.AppendLine($"      \"name\": {JsonEscape(children[i].Name)},");
-                sb.AppendLine($"      \"type\": {JsonEscape(children[i].GetType().Name)},");
-                sb.AppendLine($"      \"id\": {JsonEscape(children[i].ID.ToString())}");
-                sb.Append("    }");
-                if (i < children.Length - 1)
-                    sb.Append(",");
-                sb.AppendLine();
-            }
-            sb.AppendLine("  ]");
-
-            sb.Append("}");
-            return sb.ToString();
-        }
-
         // ------------------------------------------------------------------
-        // POST /scene/actor/property
+        // REST: POST /scene/actor/property
         // ------------------------------------------------------------------
 
-        private void HandleSetActorProperty(HttpListenerContext context, HttpListenerResponse response)
+        private void HandleRestSetActorProperty(HttpListenerContext context, HttpListenerResponse response)
         {
             var body = ReadRequestBody(context.Request);
             var data = FlaxEngine.Json.JsonSerializer.Deserialize<SetPropertyRequest>(body);
@@ -740,405 +740,79 @@ namespace FlaxMCP
                 return;
             }
 
-            var result = InvokeOnMainThread(() =>
-            {
-                Actor actor = null;
+            var args = new Dictionary<string, object>();
+            if (!string.IsNullOrEmpty(data.ActorName)) args["actorName"] = data.ActorName;
+            if (!string.IsNullOrEmpty(data.ActorId)) args["actorId"] = data.ActorId;
+            args["property"] = data.Property;
+            args["value"] = data.Value;
 
-                if (!string.IsNullOrEmpty(data.ActorId))
-                {
-                    if (Guid.TryParse(data.ActorId, out var guid))
-                        actor = FlaxEngine.Object.Find<Actor>(ref guid);
-                }
-                else
-                {
-                    actor = FindActorByName(data.ActorName);
-                }
-
-                if (actor == null)
-                    return BuildJsonObject("error", $"Actor not found: {data.ActorName ?? data.ActorId}");
-
-                try
-                {
-                    SetPropertyByPath(actor, data.Property, data.Value);
-                    return BuildJsonObject(
-                        "ok", "true",
-                        "actor", actor.Name,
-                        "property", data.Property
-                    );
-                }
-                catch (Exception ex)
-                {
-                    return BuildJsonObject("error", $"Failed to set property: {ex.Message}");
-                }
-            });
-
+            var result = ToolSetActorProperty(args);
             var statusCode = result.Contains("\"error\"") ? 400 : 200;
             WriteJson(response, statusCode, result);
         }
 
-        private void SetPropertyByPath(Actor actor, string propertyPath, object value)
+        // ------------------------------------------------------------------
+        // REST: GET /scene/find
+        // ------------------------------------------------------------------
+
+        private void HandleRestFindActors(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
         {
-            // Handle common transform shortcuts
-            if (propertyPath.StartsWith("Transform."))
-            {
-                var sub = propertyPath.Substring("Transform.".Length);
-                var transform = actor.Transform;
-
-                switch (sub)
-                {
-                    case "Position":
-                    case "Translation":
-                        transform.Translation = ParseVector3(value);
-                        actor.Transform = transform;
-                        return;
-
-                    case "Rotation":
-                    case "Orientation":
-                        transform.Orientation = ParseQuaternion(value);
-                        actor.Transform = transform;
-                        return;
-
-                    case "Scale":
-                        transform.Scale = ParseFloat3(value);
-                        actor.Transform = transform;
-                        return;
-                }
-            }
-
-            // Generic reflection-based property setter
-            var parts = propertyPath.Split('.');
-            object current = actor;
-            for (int i = 0; i < parts.Length - 1; i++)
-            {
-                var prop = current.GetType().GetProperty(parts[i],
-                    BindingFlags.Public | BindingFlags.Instance);
-                if (prop == null)
-                    throw new Exception($"Property '{parts[i]}' not found on {current.GetType().Name}");
-                current = prop.GetValue(current);
-            }
-
-            var finalProp = current.GetType().GetProperty(parts[parts.Length - 1],
-                BindingFlags.Public | BindingFlags.Instance);
-            if (finalProp == null)
-                throw new Exception($"Property '{parts[parts.Length - 1]}' not found on {current.GetType().Name}");
-
-            var converted = ConvertValue(value, finalProp.PropertyType);
-            finalProp.SetValue(current, converted);
-        }
-
-        private object ConvertValue(object value, Type targetType)
-        {
-            if (value == null)
-                return null;
-
-            if (targetType == typeof(float))
-                return Convert.ToSingle(value);
-            if (targetType == typeof(double))
-                return Convert.ToDouble(value);
-            if (targetType == typeof(int))
-                return Convert.ToInt32(value);
-            if (targetType == typeof(bool))
-                return Convert.ToBoolean(value);
-            if (targetType == typeof(string))
-                return value.ToString();
-            if (targetType == typeof(Vector3) || targetType == typeof(Float3))
-                return ParseVector3(value);
-            if (targetType == typeof(Quaternion))
-                return ParseQuaternion(value);
-
-            return value;
-        }
-
-        private Vector3 ParseVector3(object value)
-        {
-            if (value is Dictionary<string, object> dict)
-            {
-                return new Vector3(
-                    dict.ContainsKey("X") ? Convert.ToSingle(dict["X"]) : 0f,
-                    dict.ContainsKey("Y") ? Convert.ToSingle(dict["Y"]) : 0f,
-                    dict.ContainsKey("Z") ? Convert.ToSingle(dict["Z"]) : 0f
-                );
-            }
-
-            return Vector3.Zero;
-        }
-
-        private Float3 ParseFloat3(object value)
-        {
-            if (value is Dictionary<string, object> dict)
-            {
-                return new Float3(
-                    dict.ContainsKey("X") ? Convert.ToSingle(dict["X"]) : 0f,
-                    dict.ContainsKey("Y") ? Convert.ToSingle(dict["Y"]) : 0f,
-                    dict.ContainsKey("Z") ? Convert.ToSingle(dict["Z"]) : 0f
-                );
-            }
-
-            return Float3.One;
-        }
-
-        private Quaternion ParseQuaternion(object value)
-        {
-            if (value is Dictionary<string, object> dict)
-            {
-                return new Quaternion(
-                    dict.ContainsKey("X") ? Convert.ToSingle(dict["X"]) : 0f,
-                    dict.ContainsKey("Y") ? Convert.ToSingle(dict["Y"]) : 0f,
-                    dict.ContainsKey("Z") ? Convert.ToSingle(dict["Z"]) : 0f,
-                    dict.ContainsKey("W") ? Convert.ToSingle(dict["W"]) : 1f
-                );
-            }
-
-            return Quaternion.Identity;
+            var args = new Dictionary<string, object>();
+            if (query["name"] != null) args["name"] = query["name"];
+            if (query["type"] != null) args["type"] = query["type"];
+            if (query["tag"] != null) args["tag"] = query["tag"];
+            WriteJson(response, 200, ToolFindActors(args));
         }
 
         // ------------------------------------------------------------------
-        // GET /scene/find?name=partial&type=StaticModel&tag=MyTag
+        // REST: GET /editor/logs
         // ------------------------------------------------------------------
 
-        private void HandleFindActors(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
+        private void HandleRestEditorLogs(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
         {
-            var nameQuery = query["name"];
-            var typeQuery = query["type"];
-            var tagQuery = query["tag"];
-
-            var result = InvokeOnMainThread(() =>
-            {
-                var matches = new List<Actor>();
-                var scenes = Level.Scenes;
-
-                if (scenes == null || scenes.Length == 0)
-                    return BuildJsonObject("error", "No scenes loaded.");
-
-                foreach (var scene in scenes)
-                    CollectMatchingActors(scene, nameQuery, typeQuery, tagQuery, matches);
-
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                sb.AppendLine($"  \"count\": {matches.Count},");
-                sb.AppendLine("  \"actors\": [");
-
-                for (int i = 0; i < matches.Count; i++)
-                {
-                    var a = matches[i];
-                    var pos = a.Position;
-                    sb.AppendLine("    {");
-                    sb.AppendLine($"      \"name\": {JsonEscape(a.Name)},");
-                    sb.AppendLine($"      \"type\": {JsonEscape(a.GetType().Name)},");
-                    sb.AppendLine($"      \"id\": {JsonEscape(a.ID.ToString())},");
-                    sb.AppendLine($"      \"position\": {{ \"X\": {pos.X}, \"Y\": {pos.Y}, \"Z\": {pos.Z} }}");
-                    sb.Append("    }");
-                    if (i < matches.Count - 1)
-                        sb.Append(",");
-                    sb.AppendLine();
-                }
-
-                sb.AppendLine("  ]");
-                sb.Append("}");
-                return sb.ToString();
-            });
-
-            WriteJson(response, 200, result);
-        }
-
-        private void CollectMatchingActors(Actor actor, string nameQuery, string typeQuery, string tagQuery, List<Actor> results)
-        {
-            bool matches = true;
-
-            if (!string.IsNullOrEmpty(nameQuery))
-                matches &= actor.Name != null && actor.Name.IndexOf(nameQuery, StringComparison.OrdinalIgnoreCase) >= 0;
-
-            if (!string.IsNullOrEmpty(typeQuery))
-                matches &= string.Equals(actor.GetType().Name, typeQuery, StringComparison.OrdinalIgnoreCase);
-
-            if (!string.IsNullOrEmpty(tagQuery))
-            {
-                bool hasMatchingTag = false;
-                if (actor.Tags != null)
-                {
-                    foreach (var tag in actor.Tags)
-                    {
-                        if (tag.ToString().IndexOf(tagQuery, StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            hasMatchingTag = true;
-                            break;
-                        }
-                    }
-                }
-                matches &= hasMatchingTag;
-            }
-
-            if (matches)
-                results.Add(actor);
-
-            foreach (var child in actor.Children)
-                CollectMatchingActors(child, nameQuery, typeQuery, tagQuery, results);
+            var args = new Dictionary<string, object>();
+            if (query["count"] != null) args["count"] = query["count"];
+            WriteJson(response, 200, ToolGetEditorLogs(args));
         }
 
         // ------------------------------------------------------------------
-        // GET /editor/logs?count=50
+        // REST: POST /editor/play & /editor/stop
         // ------------------------------------------------------------------
 
-        private void HandleEditorLogs(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
+        private void HandleRestEditorPlay(HttpListenerResponse response)
         {
-            int count = 50;
-            if (query["count"] != null)
-                int.TryParse(query["count"], out count);
+            WriteJson(response, 200, ToolEditorPlay(new Dictionary<string, object>()));
+        }
 
-            count = Math.Min(count, MaxLogEntries);
-
-            List<LogEntry> entries;
-            lock (_logLock)
-            {
-                var start = Math.Max(0, _logBuffer.Count - count);
-                entries = _logBuffer.GetRange(start, _logBuffer.Count - start);
-            }
-
-            var sb = new StringBuilder();
-            sb.AppendLine("{");
-            sb.AppendLine($"  \"count\": {entries.Count},");
-            sb.AppendLine("  \"logs\": [");
-
-            for (int i = 0; i < entries.Count; i++)
-            {
-                var entry = entries[i];
-                sb.AppendLine("    {");
-                sb.AppendLine($"      \"level\": {JsonEscape(entry.Level)},");
-                sb.AppendLine($"      \"message\": {JsonEscape(entry.Message)},");
-                sb.AppendLine($"      \"timestamp\": {JsonEscape(entry.Timestamp)}");
-                sb.Append("    }");
-                if (i < entries.Count - 1)
-                    sb.Append(",");
-                sb.AppendLine();
-            }
-
-            sb.AppendLine("  ]");
-            sb.Append("}");
-
-            WriteJson(response, 200, sb.ToString());
+        private void HandleRestEditorStop(HttpListenerResponse response)
+        {
+            WriteJson(response, 200, ToolEditorStop(new Dictionary<string, object>()));
         }
 
         // ------------------------------------------------------------------
-        // POST /editor/play
+        // REST: GET /content/find
         // ------------------------------------------------------------------
 
-        private void HandleEditorPlay(HttpListenerResponse response)
+        private void HandleRestContentFind(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
         {
-            var result = InvokeOnMainThread(() =>
-            {
-                if (Editor.Instance.StateMachine.IsPlayMode)
-                    return BuildJsonObject("status", "already_playing");
-
-                Editor.Instance.Simulation.RequestStartPlayScenes();
-                return BuildJsonObject("status", "play_requested");
-            });
-
-            WriteJson(response, 200, result);
-        }
-
-        // ------------------------------------------------------------------
-        // POST /editor/stop
-        // ------------------------------------------------------------------
-
-        private void HandleEditorStop(HttpListenerResponse response)
-        {
-            var result = InvokeOnMainThread(() =>
-            {
-                if (!Editor.Instance.StateMachine.IsPlayMode)
-                    return BuildJsonObject("status", "not_playing");
-
-                Editor.Instance.Simulation.RequestStopPlay();
-                return BuildJsonObject("status", "stop_requested");
-            });
-
-            WriteJson(response, 200, result);
-        }
-
-        // ------------------------------------------------------------------
-        // GET /content/find?path=Content/Materials/M_Base.flax
-        // ------------------------------------------------------------------
-
-        private void HandleContentFind(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
-        {
-            var path = query["path"];
-            if (string.IsNullOrEmpty(path))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'path' query parameter."));
-                return;
-            }
-
-            var result = InvokeOnMainThread(() =>
-            {
-                var item = Editor.Instance.ContentDatabase.Find(path);
-                if (item == null)
-                    return BuildJsonObject("error", $"Content item not found: {path}");
-
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                sb.AppendLine($"  \"name\": {JsonEscape(item.ShortName)},");
-                sb.AppendLine($"  \"type\": {JsonEscape(item.GetType().Name)},");
-                sb.AppendLine($"  \"path\": {JsonEscape(item.Path)},");
-                sb.AppendLine($"  \"isFolder\": {(item is ContentFolder ? "true" : "false")},");
-
-                if (item is AssetItem assetItem)
-                {
-                    sb.AppendLine($"  \"id\": {JsonEscape(assetItem.ID.ToString())},");
-                    sb.AppendLine($"  \"typeName\": {JsonEscape(assetItem.TypeName)}");
-                }
-                else
-                {
-                    sb.AppendLine($"  \"id\": \"\"");
-                }
-
-                sb.Append("}");
-                return sb.ToString();
-            });
-
+            var args = new Dictionary<string, object>();
+            if (query["path"] != null) args["path"] = query["path"];
+            var result = ToolFindContent(args);
             var statusCode = result.Contains("\"error\"") ? 404 : 200;
             WriteJson(response, statusCode, result);
         }
 
         // ------------------------------------------------------------------
-        // GET /scripts/read?path=Source/Game/MyScript.cs
+        // REST: GET /scripts/read
         // ------------------------------------------------------------------
 
-        private void HandleScriptRead(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
+        private void HandleRestScriptRead(HttpListenerResponse response, System.Collections.Specialized.NameValueCollection query)
         {
-            var path = query["path"];
-            if (string.IsNullOrEmpty(path))
-            {
-                WriteJson(response, 400, BuildJsonObject("error", "Missing 'path' query parameter."));
-                return;
-            }
-
-            var absPath = Path.Combine(Globals.ProjectFolder, path);
-
-            if (!File.Exists(absPath))
-            {
-                WriteJson(response, 404, BuildJsonObject("error", $"File not found: {path}"));
-                return;
-            }
-
-            // Only allow reading source files for safety
-            var ext = Path.GetExtension(absPath).ToLowerInvariant();
-            if (ext != ".cs" && ext != ".cpp" && ext != ".h" && ext != ".json" && ext != ".xml" && ext != ".build")
-            {
-                WriteJson(response, 403, BuildJsonObject("error", $"File type not allowed: {ext}"));
-                return;
-            }
-
-            try
-            {
-                var content = File.ReadAllText(absPath);
-                WriteJson(response, 200, BuildJsonObject(
-                    "path", path,
-                    "content", content
-                ));
-            }
-            catch (Exception ex)
-            {
-                WriteJson(response, 500, BuildJsonObject("error", $"Failed to read file: {ex.Message}"));
-            }
+            var args = new Dictionary<string, object>();
+            if (query["path"] != null) args["path"] = query["path"];
+            var result = ToolReadScript(args);
+            var statusCode = result.Contains("\"error\"") ? 400 : 200;
+            WriteJson(response, statusCode, result);
         }
 
         // ------------------------------------------------------------------
@@ -1166,7 +840,6 @@ namespace FlaxMCP
                     Timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
                 });
 
-                // Trim to max size
                 while (_logBuffer.Count > MaxLogEntries)
                     _logBuffer.RemoveAt(0);
             }
@@ -1207,6 +880,27 @@ namespace FlaxMCP
             return null;
         }
 
+        /// <summary>
+        /// Resolves an actor from a dictionary containing optional "name",
+        /// "id", "actorName", or "actorId" keys.
+        /// </summary>
+        private Actor ResolveActor(Dictionary<string, object> args)
+        {
+            var id = GetArgString(args, "id") ?? GetArgString(args, "actorId");
+            var name = GetArgString(args, "name") ?? GetArgString(args, "actorName") ?? GetArgString(args, "actor");
+
+            if (!string.IsNullOrEmpty(id))
+            {
+                if (Guid.TryParse(id, out var guid))
+                    return FlaxEngine.Object.Find<Actor>(ref guid);
+            }
+
+            if (!string.IsNullOrEmpty(name))
+                return FindActorByName(name);
+
+            return null;
+        }
+
         // ------------------------------------------------------------------
         // Main thread marshaling
         // ------------------------------------------------------------------
@@ -1214,7 +908,6 @@ namespace FlaxMCP
         /// <summary>
         /// Invokes a function on the main thread via <see cref="Scripting.InvokeOnUpdate"/>
         /// and blocks the calling (HTTP worker) thread until the result is available.
-        /// Includes a timeout to prevent deadlocks.
         /// </summary>
         private T InvokeOnMainThread<T>(Func<T> func, int timeoutMs = 10000)
         {
@@ -1255,6 +948,12 @@ namespace FlaxMCP
         {
             response.StatusCode = statusCode;
             response.ContentType = "application/json; charset=utf-8";
+
+            if (statusCode == 204 || string.IsNullOrEmpty(json))
+            {
+                response.ContentLength64 = 0;
+                return;
+            }
 
             var bytes = Encoding.UTF8.GetBytes(json);
             response.ContentLength64 = bytes.Length;
@@ -1343,7 +1042,454 @@ namespace FlaxMCP
         }
 
         // ------------------------------------------------------------------
-        // JSON request data classes
+        // Argument extraction helpers
+        // ------------------------------------------------------------------
+
+        private static string GetArgString(Dictionary<string, object> args, string key, string defaultValue = null)
+        {
+            if (args.TryGetValue(key, out var val) && val != null)
+                return val.ToString();
+            return defaultValue;
+        }
+
+        private static float GetArgFloat(Dictionary<string, object> args, string key, float defaultValue = 0f)
+        {
+            if (args.TryGetValue(key, out var val) && val != null)
+            {
+                if (val is double d) return (float)d;
+                if (val is long l) return l;
+                if (val is float f) return f;
+                if (float.TryParse(val.ToString(), System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var parsed))
+                    return parsed;
+            }
+            return defaultValue;
+        }
+
+        private static int GetArgInt(Dictionary<string, object> args, string key, int defaultValue = 0)
+        {
+            if (args.TryGetValue(key, out var val) && val != null)
+            {
+                if (val is long l) return (int)l;
+                if (val is double d) return (int)d;
+                if (val is int i) return i;
+                if (int.TryParse(val.ToString(), out var parsed))
+                    return parsed;
+            }
+            return defaultValue;
+        }
+
+        private static bool GetArgBool(Dictionary<string, object> args, string key, bool defaultValue = false)
+        {
+            if (args.TryGetValue(key, out var val) && val != null)
+            {
+                if (val is bool b) return b;
+                if (bool.TryParse(val.ToString(), out var parsed))
+                    return parsed;
+            }
+            return defaultValue;
+        }
+
+        // ------------------------------------------------------------------
+        // Property manipulation helpers
+        // ------------------------------------------------------------------
+
+        private void SetPropertyByPath(Actor actor, string propertyPath, object value)
+        {
+            if (propertyPath.StartsWith("Transform."))
+            {
+                var sub = propertyPath.Substring("Transform.".Length);
+                var transform = actor.Transform;
+
+                switch (sub)
+                {
+                    case "Position":
+                    case "Translation":
+                        transform.Translation = ParseVector3(value);
+                        actor.Transform = transform;
+                        return;
+
+                    case "Rotation":
+                    case "Orientation":
+                        transform.Orientation = ParseQuaternion(value);
+                        actor.Transform = transform;
+                        return;
+
+                    case "Scale":
+                        transform.Scale = ParseFloat3(value);
+                        actor.Transform = transform;
+                        return;
+                }
+            }
+
+            var parts = propertyPath.Split('.');
+            object current = actor;
+            for (int i = 0; i < parts.Length - 1; i++)
+            {
+                var prop = current.GetType().GetProperty(parts[i],
+                    BindingFlags.Public | BindingFlags.Instance);
+                if (prop == null)
+                    throw new Exception($"Property '{parts[i]}' not found on {current.GetType().Name}");
+                current = prop.GetValue(current);
+            }
+
+            var finalProp = current.GetType().GetProperty(parts[parts.Length - 1],
+                BindingFlags.Public | BindingFlags.Instance);
+            if (finalProp == null)
+                throw new Exception($"Property '{parts[parts.Length - 1]}' not found on {current.GetType().Name}");
+
+            var converted = ConvertPropertyValue(value, finalProp.PropertyType);
+            finalProp.SetValue(current, converted);
+        }
+
+        private object ConvertPropertyValue(object value, Type targetType)
+        {
+            if (value == null)
+                return null;
+
+            if (targetType == typeof(float))
+                return Convert.ToSingle(value);
+            if (targetType == typeof(double))
+                return Convert.ToDouble(value);
+            if (targetType == typeof(int))
+                return Convert.ToInt32(value);
+            if (targetType == typeof(bool))
+                return Convert.ToBoolean(value);
+            if (targetType == typeof(string))
+                return value.ToString();
+            if (targetType == typeof(Vector3) || targetType == typeof(Float3))
+                return ParseVector3(value);
+            if (targetType == typeof(Quaternion))
+                return ParseQuaternion(value);
+
+            return value;
+        }
+
+        private Vector3 ParseVector3(object value)
+        {
+            if (value is Dictionary<string, object> dict)
+            {
+                return new Vector3(
+                    dict.ContainsKey("X") ? Convert.ToSingle(dict["X"]) : 0f,
+                    dict.ContainsKey("Y") ? Convert.ToSingle(dict["Y"]) : 0f,
+                    dict.ContainsKey("Z") ? Convert.ToSingle(dict["Z"]) : 0f
+                );
+            }
+
+            return Vector3.Zero;
+        }
+
+        private Float3 ParseFloat3(object value)
+        {
+            if (value is Dictionary<string, object> dict)
+            {
+                return new Float3(
+                    dict.ContainsKey("X") ? Convert.ToSingle(dict["X"]) : 0f,
+                    dict.ContainsKey("Y") ? Convert.ToSingle(dict["Y"]) : 0f,
+                    dict.ContainsKey("Z") ? Convert.ToSingle(dict["Z"]) : 0f
+                );
+            }
+
+            return Float3.One;
+        }
+
+        private Quaternion ParseQuaternion(object value)
+        {
+            if (value is Dictionary<string, object> dict)
+            {
+                return new Quaternion(
+                    dict.ContainsKey("X") ? Convert.ToSingle(dict["X"]) : 0f,
+                    dict.ContainsKey("Y") ? Convert.ToSingle(dict["Y"]) : 0f,
+                    dict.ContainsKey("Z") ? Convert.ToSingle(dict["Z"]) : 0f,
+                    dict.ContainsKey("W") ? Convert.ToSingle(dict["W"]) : 1f
+                );
+            }
+
+            return Quaternion.Identity;
+        }
+
+        private void SetMaterialParameter(MaterialInstance instance, string name, object value)
+        {
+            if (value is double d)
+            {
+                instance.SetParameterValue(name, (float)d);
+            }
+            else if (value is long l)
+            {
+                instance.SetParameterValue(name, (float)l);
+            }
+            else if (value is string s)
+            {
+                var texture = FlaxEngine.Content.Load<Texture>(s);
+                if (texture != null)
+                    instance.SetParameterValue(name, texture);
+                else
+                    Debug.LogWarning($"[McpServer] Texture not found for parameter '{name}': {s}");
+            }
+            else if (value != null)
+            {
+                instance.SetParameterValue(name, value);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Scene tree helpers
+        // ------------------------------------------------------------------
+
+        private void BuildActorJson(StringBuilder sb, Actor actor, int indent)
+        {
+            var pad = new string(' ', indent * 2);
+            var innerPad = new string(' ', (indent + 1) * 2);
+
+            sb.AppendLine("{");
+            sb.AppendLine($"{innerPad}\"name\": {JsonEscape(actor.Name)},");
+            sb.AppendLine($"{innerPad}\"type\": {JsonEscape(actor.GetType().Name)},");
+            sb.AppendLine($"{innerPad}\"id\": {JsonEscape(actor.ID.ToString())},");
+            sb.AppendLine($"{innerPad}\"isActive\": {(actor.IsActive ? "true" : "false")},");
+
+            var pos = actor.Position;
+            sb.AppendLine($"{innerPad}\"position\": {{ \"X\": {pos.X}, \"Y\": {pos.Y}, \"Z\": {pos.Z} }},");
+
+            sb.AppendLine($"{innerPad}\"children\": [");
+            var children = actor.Children;
+            for (int i = 0; i < children.Length; i++)
+            {
+                sb.Append($"{innerPad}  ");
+                BuildActorJson(sb, children[i], indent + 2);
+                if (i < children.Length - 1)
+                    sb.Append(",");
+                sb.AppendLine();
+            }
+
+            sb.AppendLine($"{innerPad}]");
+            sb.Append($"{pad}}}");
+        }
+
+        private string BuildActorDetailJson(Actor actor)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("{");
+            sb.AppendLine($"  \"name\": {JsonEscape(actor.Name)},");
+            sb.AppendLine($"  \"type\": {JsonEscape(actor.GetType().Name)},");
+            sb.AppendLine($"  \"id\": {JsonEscape(actor.ID.ToString())},");
+            sb.AppendLine($"  \"isActive\": {(actor.IsActive ? "true" : "false")},");
+
+            var t = actor.Transform;
+            sb.AppendLine("  \"transform\": {");
+            sb.AppendLine($"    \"position\": {{ \"X\": {t.Translation.X}, \"Y\": {t.Translation.Y}, \"Z\": {t.Translation.Z} }},");
+            sb.AppendLine($"    \"rotation\": {{ \"X\": {t.Orientation.X}, \"Y\": {t.Orientation.Y}, \"Z\": {t.Orientation.Z}, \"W\": {t.Orientation.W} }},");
+            sb.AppendLine($"    \"scale\": {{ \"X\": {t.Scale.X}, \"Y\": {t.Scale.Y}, \"Z\": {t.Scale.Z} }}");
+            sb.AppendLine("  },");
+
+            sb.Append("  \"tags\": [");
+            if (actor.Tags != null && actor.Tags.Length > 0)
+            {
+                for (int ti = 0; ti < actor.Tags.Length; ti++)
+                {
+                    sb.Append(JsonEscape(actor.Tags[ti].ToString()));
+                    if (ti < actor.Tags.Length - 1)
+                        sb.Append(", ");
+                }
+            }
+            sb.AppendLine("],");
+
+            sb.AppendLine("  \"scripts\": [");
+            var scripts = actor.Scripts;
+            for (int i = 0; i < scripts.Length; i++)
+            {
+                var script = scripts[i];
+                sb.AppendLine("    {");
+                sb.AppendLine($"      \"type\": {JsonEscape(script.GetType().FullName)},");
+                sb.AppendLine($"      \"enabled\": {(script.Enabled ? "true" : "false")},");
+                sb.AppendLine($"      \"id\": {JsonEscape(script.ID.ToString())}");
+                sb.Append("    }");
+                if (i < scripts.Length - 1)
+                    sb.Append(",");
+                sb.AppendLine();
+            }
+            sb.AppendLine("  ],");
+
+            sb.AppendLine("  \"children\": [");
+            var children = actor.Children;
+            for (int i = 0; i < children.Length; i++)
+            {
+                sb.AppendLine("    {");
+                sb.AppendLine($"      \"name\": {JsonEscape(children[i].Name)},");
+                sb.AppendLine($"      \"type\": {JsonEscape(children[i].GetType().Name)},");
+                sb.AppendLine($"      \"id\": {JsonEscape(children[i].ID.ToString())}");
+                sb.Append("    }");
+                if (i < children.Length - 1)
+                    sb.Append(",");
+                sb.AppendLine();
+            }
+            sb.AppendLine("  ]");
+
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        // ------------------------------------------------------------------
+        // Collection helpers
+        // ------------------------------------------------------------------
+
+        private void CollectMatchingActors(Actor actor, string nameQuery, string typeQuery, string tagQuery, List<Actor> results)
+        {
+            bool matches = true;
+
+            if (!string.IsNullOrEmpty(nameQuery))
+                matches &= actor.Name != null && actor.Name.IndexOf(nameQuery, StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (!string.IsNullOrEmpty(typeQuery))
+                matches &= string.Equals(actor.GetType().Name, typeQuery, StringComparison.OrdinalIgnoreCase);
+
+            if (!string.IsNullOrEmpty(tagQuery))
+            {
+                bool hasMatchingTag = false;
+                if (actor.Tags != null)
+                {
+                    foreach (var tag in actor.Tags)
+                    {
+                        if (tag.ToString().IndexOf(tagQuery, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            hasMatchingTag = true;
+                            break;
+                        }
+                    }
+                }
+                matches &= hasMatchingTag;
+            }
+
+            if (matches)
+                results.Add(actor);
+
+            foreach (var child in actor.Children)
+                CollectMatchingActors(child, nameQuery, typeQuery, tagQuery, results);
+        }
+
+        private void CollectActorsOfType<T>(Actor root, List<T> results) where T : Actor
+        {
+            if (root is T typed)
+                results.Add(typed);
+
+            foreach (var child in root.Children)
+                CollectActorsOfType(child, results);
+        }
+
+        private void CollectActorsOfTypeName(Actor root, string typeName, List<Actor> results)
+        {
+            if (string.Equals(root.GetType().Name, typeName, StringComparison.OrdinalIgnoreCase))
+                results.Add(root);
+
+            foreach (var child in root.Children)
+                CollectActorsOfTypeName(child, typeName, results);
+        }
+
+        private void CollectContentItemsByType(ContentFolder folder, string typeName, List<string> results)
+        {
+            if (folder == null)
+                return;
+
+            foreach (var child in folder.Children)
+            {
+                if (child is ContentFolder childFolder)
+                {
+                    CollectContentItemsByType(childFolder, typeName, results);
+                }
+                else if (child is AssetItem assetItem)
+                {
+                    if (string.IsNullOrEmpty(typeName) ||
+                        assetItem.TypeName.IndexOf(typeName, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        results.Add(BuildJsonObject(
+                            "name", child.ShortName,
+                            "type", assetItem.TypeName,
+                            "path", child.Path,
+                            "id", assetItem.ID.ToString()
+                        ));
+                    }
+                }
+            }
+        }
+
+        private void SearchContentItems(ContentFolder folder, string nameQuery, string typeFilter, List<string> results)
+        {
+            if (folder == null)
+                return;
+
+            foreach (var child in folder.Children)
+            {
+                if (child is ContentFolder childFolder)
+                {
+                    SearchContentItems(childFolder, nameQuery, typeFilter, results);
+                }
+                else if (child is AssetItem assetItem)
+                {
+                    bool nameMatch = string.IsNullOrEmpty(nameQuery) ||
+                        (child.ShortName != null && child.ShortName.IndexOf(nameQuery, StringComparison.OrdinalIgnoreCase) >= 0);
+
+                    bool typeMatch = string.IsNullOrEmpty(typeFilter) ||
+                        assetItem.TypeName.IndexOf(typeFilter, StringComparison.OrdinalIgnoreCase) >= 0;
+
+                    if (nameMatch && typeMatch)
+                    {
+                        results.Add(BuildJsonObject(
+                            "name", child.ShortName,
+                            "type", assetItem.TypeName,
+                            "path", child.Path,
+                            "id", assetItem.ID.ToString()
+                        ));
+                    }
+                }
+            }
+        }
+
+        private void CollectContentTree(ContentFolder folder, StringBuilder sb, int indent)
+        {
+            if (folder == null)
+                return;
+
+            var pad = new string(' ', indent * 2);
+            var innerPad = new string(' ', (indent + 1) * 2);
+
+            sb.AppendLine($"{pad}{{");
+            sb.AppendLine($"{innerPad}\"name\": {JsonEscape(folder.ShortName)},");
+            sb.AppendLine($"{innerPad}\"path\": {JsonEscape(folder.Path)},");
+            sb.AppendLine($"{innerPad}\"type\": \"Folder\",");
+
+            // Count direct child assets
+            var assetCount = folder.Children.Count(c => !(c is ContentFolder));
+            sb.AppendLine($"{innerPad}\"assetCount\": {assetCount},");
+
+            sb.AppendLine($"{innerPad}\"children\": [");
+
+            var childFolders = folder.Children.Where(c => c is ContentFolder).ToList();
+            for (int i = 0; i < childFolders.Count; i++)
+            {
+                CollectContentTree((ContentFolder)childFolders[i], sb, indent + 2);
+                if (i < childFolders.Count - 1)
+                    sb.Append(",");
+                sb.AppendLine();
+            }
+
+            sb.AppendLine($"{innerPad}]");
+            sb.Append($"{pad}}}");
+        }
+
+        private static float ParseFloat(string value, float defaultValue)
+        {
+            if (string.IsNullOrEmpty(value))
+                return defaultValue;
+
+            float result;
+            if (float.TryParse(value, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out result))
+                return result;
+
+            return defaultValue;
+        }
+
+        // ------------------------------------------------------------------
+        // JSON request data classes (used by legacy REST endpoints)
         // ------------------------------------------------------------------
 
         [Serializable]
