@@ -606,6 +606,30 @@ namespace FlaxMCP
                 ToolSetMaterialParam);
 
             // ============================================================
+            // Material Graph
+            // ============================================================
+
+            RegisterTool("build_pbr_material",
+                "Build a PBR material with a full node graph. Creates parameters for BaseColorMap, NormalMap, ORMMap (packed AO/Roughness/Metallic), EmissiveMap textures and RoughnessValue, MetalnessValue floats. Wires ORM channels to AO/Roughness/Metalness inputs.",
+                SchemaObjectRequired(
+                    new[] { "outputPath" },
+                    SchemaPropStr("outputPath", "Output path relative to project folder (e.g. Content/Materials/M_MyMat.flax)"),
+                    SchemaPropStr("name", "Material name (defaults to filename)"),
+                    SchemaPropNum("roughnessDefault", "Default roughness value when no ORM map (default 0.5)"),
+                    SchemaPropNum("metalnessDefault", "Default metalness value when no ORM map (default 0.0)")),
+                ToolBuildPbrMaterial);
+
+            // ============================================================
+            // Asset Pipeline
+            // ============================================================
+
+            RegisterTool("run_asset_pipeline",
+                "Run the full asset import pipeline: import textures, then models, then create materials from material_mappings.json. Steps are chained automatically.",
+                SchemaObject(
+                    SchemaPropStr("step", "Run a specific step: 'textures', 'models', 'materials', or 'all' (default: all)")),
+                ToolRunAssetPipeline);
+
+            // ============================================================
             // Batch Execute
             // ============================================================
 

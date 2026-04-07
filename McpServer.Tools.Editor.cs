@@ -980,5 +980,47 @@ namespace FlaxMCP
                 return sb.ToString();
             });
         }
+
+        // ==================================================================
+        // TOOL HANDLERS: Asset Pipeline
+        // ==================================================================
+
+        /// <summary>
+        /// Triggers the asset import pipeline via the AssetConverterPlugin.
+        /// Supports running individual steps or the full chained pipeline.
+        /// </summary>
+        private string ToolRunAssetPipeline(Dictionary<string, object> args)
+        {
+            var step = GetArgString(args, "step", "all");
+
+            return InvokeOnMainThread(() =>
+            {
+                var plugin = PluginManager.GetPlugin<Embergrim.Editor.AssetConverterPlugin>();
+                if (plugin == null)
+                    return BuildJsonObject("error", "AssetConverterPlugin not found. Is it loaded?");
+
+                switch (step.ToLowerInvariant())
+                {
+                    case "textures":
+                        plugin.OnImportAllTextures();
+                        return BuildJsonObject("ok", "true", "step", "textures", "status", "import_queued");
+
+                    case "models":
+                        plugin.OnImportAllModels();
+                        return BuildJsonObject("ok", "true", "step", "models", "status", "import_queued");
+
+                    case "materials":
+                        plugin.OnCreateAllMaterials();
+                        return BuildJsonObject("ok", "true", "step", "materials", "status", "creation_started");
+
+                    case "all":
+                        plugin.OnRunFullPipeline();
+                        return BuildJsonObject("ok", "true", "step", "all", "status", "pipeline_started");
+
+                    default:
+                        return BuildJsonObject("error", $"Unknown step: {step}. Use: textures, models, materials, all");
+                }
+            });
+        }
     }
 }
