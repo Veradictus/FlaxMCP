@@ -986,7 +986,9 @@ namespace FlaxMCP
         // ==================================================================
 
         /// <summary>
-        /// Triggers the asset import pipeline via the AssetConverterPlugin.
+        /// Triggers the asset import pipeline via a project-provided AssetConverterPlugin.
+        /// The plugin is resolved by type name via reflection so FlaxMCP compiles in any
+        /// project; the tool reports an error when no such plugin is loaded.
         /// Supports running individual steps or the full chained pipeline.
         /// </summary>
         private string ToolRunAssetPipeline(Dictionary<string, object> args)
@@ -995,31 +997,44 @@ namespace FlaxMCP
 
             return InvokeOnMainThread(() =>
             {
-                var plugin = PluginManager.GetPlugin<Embergrim.Editor.AssetConverterPlugin>();
+                var plugin = PluginManager.EditorPlugins.Cast<Plugin>()
+                    .Concat(PluginManager.GamePlugins.Cast<Plugin>())
+                    .FirstOrDefault(p => p.GetType().Name == "AssetConverterPlugin");
                 if (plugin == null)
                     return BuildJsonObject("error", "AssetConverterPlugin not found. Is it loaded?");
 
+                string methodName, status;
                 switch (step.ToLowerInvariant())
                 {
                     case "textures":
-                        plugin.OnImportAllTextures();
-                        return BuildJsonObject("ok", "true", "step", "textures", "status", "import_queued");
+                        methodName = "OnImportAllTextures";
+                        status = "import_queued";
+                        break;
 
                     case "models":
-                        plugin.OnImportAllModels();
-                        return BuildJsonObject("ok", "true", "step", "models", "status", "import_queued");
+                        methodName = "OnImportAllModels";
+                        status = "import_queued";
+                        break;
 
                     case "materials":
-                        plugin.OnCreateAllMaterials();
-                        return BuildJsonObject("ok", "true", "step", "materials", "status", "creation_started");
+                        methodName = "OnCreateAllMaterials";
+                        status = "creation_started";
+                        break;
 
                     case "all":
-                        plugin.OnRunFullPipeline();
-                        return BuildJsonObject("ok", "true", "step", "all", "status", "pipeline_started");
+                        methodName = "OnRunFullPipeline";
+                        status = "pipeline_started";
+                        break;
 
                     default:
                         return BuildJsonObject("error", $"Unknown step: {step}. Use: textures, models, materials, all");
                 }
+
+                var method = plugin.GetType().GetMethod(methodName, BindingFlags.Public | BindingFlags.Instance);
+                if (method == null)
+                    return BuildJsonObject("error", $"AssetConverterPlugin has no public method {methodName}.");
+                method.Invoke(plugin, null);
+                return BuildJsonObject("ok", "true", "step", step.ToLowerInvariant(), "status", status);
             });
         }
     }
