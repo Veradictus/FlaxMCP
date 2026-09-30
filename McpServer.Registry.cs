@@ -42,9 +42,26 @@ namespace FlaxMCP
                 ToolGetEditorState);
 
             RegisterTool("get_editor_logs",
-                "Get recent editor log entries.",
-                SchemaObject(SchemaPropInt("count", "Number of log entries to retrieve (default 50)")),
+                "Get recent editor log entries, including native engine messages such as shader and asset errors.",
+                SchemaObject(
+                    SchemaPropInt("count", "Number of log entries to retrieve (default 50)"),
+                    SchemaPropStr("level", "Minimum level: 'info' (default), 'warning' or 'error'"),
+                    SchemaPropStr("contains", "Only entries whose message contains this text (case-insensitive)"),
+                    SchemaPropStr("source", "'file' (default): the editor's full log file. 'managed': only messages logged from C#")),
                 ToolGetEditorLogs);
+
+            RegisterTool("compile_shader",
+                "Compile a project shader source (Source/Shaders/*.shader): imports it into Content/Shaders if new or changed, loads it, and returns whether it compiled plus the compiler errors and warnings.",
+                SchemaObjectRequired(
+                    new[] { "path" },
+                    SchemaPropStr("path", "Project-relative path of the .shader file, e.g. Source/Shaders/Fireball.shader"),
+                    SchemaPropInt("timeoutMs", "How long to wait for import and compilation (default: 60000)")),
+                ToolCompileShader);
+
+            RegisterTool("get_shader_errors",
+                "Get shader and material compilation errors and warnings from this editor session's log.",
+                SchemaObject(SchemaPropInt("count", "Maximum entries to return, newest last (default 20)")),
+                ToolGetShaderErrors);
 
             // ============================================================
             // Scene
@@ -322,12 +339,14 @@ namespace FlaxMCP
             // Rendering
             // ============================================================
 
-            RegisterTool("take_screenshot",
-                "Capture a screenshot of the editor viewport.",
-                SchemaObjectRequired(
-                    new[] { "outputPath" },
-                    SchemaPropStr("outputPath", "Absolute or project-relative output file path")),
-                ToolTakeScreenshot);
+            RegisterRichTool("take_screenshot",
+                "Capture the editor viewport or the game view and return the image. Waits until the file is written.",
+                SchemaObject(
+                    SchemaPropStr("source", "'auto' (game view while playing, otherwise editor viewport), 'editor' or 'game'. Default: auto"),
+                    SchemaPropStr("outputPath", "Absolute or project-relative file path (.jpg or .png). Default: a .jpg in Cache/McpScreenshots"),
+                    SchemaPropBool("includeImage", "Return the image inline (default: true)"),
+                    SchemaPropInt("timeoutMs", "How long to wait for the capture (default: 15000)")),
+                ToolTakeScreenshotRich);
 
             RegisterTool("get_rendering_settings",
                 "Get current rendering and post-processing settings.",
@@ -445,8 +464,8 @@ namespace FlaxMCP
                 ToolCompileScripts);
 
             RegisterTool("get_script_errors",
-                "Get script compilation errors and warnings.",
-                SchemaEmpty(),
+                "Get C# compiler errors (and optionally warnings) from the most recent script compilation.",
+                SchemaObject(SchemaPropBool("includeWarnings", "Also list compiler warnings (default: false)")),
                 ToolGetScriptErrors);
 
             // ============================================================
@@ -697,9 +716,17 @@ namespace FlaxMCP
             // ============================================================
 
             RegisterTool("get_frame_stats",
-                "Get current frame timing and rendering statistics.",
+                "Get frame timing, CPU draw/update times, draw calls, triangles and memory. GPU time is only filled while the profiler is on.",
                 SchemaEmpty(),
                 ToolGetFrameStats);
+
+            RegisterTool("get_gpu_profile",
+                "Turn the GPU profiler on for a number of frames and return averaged GPU time per rendering pass, plus the slowest passes.",
+                SchemaObject(
+                    SchemaPropInt("frames", "Frames to average (default: 30, max: 300)"),
+                    SchemaPropInt("maxDepth", "Deepest pass nesting level to list (default: 3)"),
+                    SchemaPropNum("minMs", "Hide passes cheaper than this many milliseconds (default: 0.01)")),
+                ToolGetGpuProfile);
 
             // ============================================================
             // Editor Windows

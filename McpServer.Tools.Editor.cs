@@ -4,9 +4,11 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 using FlaxEditor;
 using FlaxEditor.Content.Settings;
 using FlaxEngine;
+using Newtonsoft.Json.Linq;
 
 namespace FlaxMCP
 {
@@ -82,13 +84,24 @@ namespace FlaxMCP
                 sb.AppendLine($"  \"totalAssetCount\": {assetCount},");
 
                 // Recent errors
-                List<LogEntry> errors;
-                lock (_logLock)
+                // The log file also holds native errors (shaders, assets) the managed hook misses.
+                List<LogEntry> errors = null;
+                try
                 {
-                    errors = _logBuffer
-                        .Where(e => e.Level == "Error" || e.Level == "Exception")
-                        .TakeLast(10)
-                        .ToList();
+                    errors = ReadEditorLogFile(out _)?.Where(e => LogLevelRank(e.Level) >= 2).TakeLast(10).ToList();
+                }
+                catch (IOException)
+                {
+                }
+                if (errors == null)
+                {
+                    lock (_logLock)
+                    {
+                        errors = _logBuffer
+                            .Where(e => e.Level == "Error" || e.Level == "Exception")
+                            .TakeLast(10)
+                            .ToList();
+                    }
                 }
 
                 sb.AppendLine($"  \"recentErrorCount\": {errors.Count},");
@@ -175,17 +188,41 @@ namespace FlaxMCP
         private string ToolGetEditorLogs(Dictionary<string, object> args)
         {
             int count = GetArgInt(args, "count", 50);
-            count = Math.Min(count, MaxLogEntries);
+            count = Math.Clamp(count, 1, MaxLogEntries);
+            var source = (GetArgString(args, "source", "file") ?? "file").ToLowerInvariant();
+            var minLevel = GetArgString(args, "level");
+            var contains = GetArgString(args, "contains");
 
             List<LogEntry> entries;
-            lock (_logLock)
+            string logFile = null;
+            if (source == "file")
             {
-                var start = Math.Max(0, _logBuffer.Count - count);
-                entries = _logBuffer.GetRange(start, _logBuffer.Count - start);
+                entries = ReadEditorLogFile(out logFile);
+                if (entries == null)
+                    return BuildJsonObject("error", "Could not find the editor log file. Use source 'managed' for messages logged from C#.");
             }
+            else if (source == "managed")
+            {
+                lock (_logLock)
+                    entries = new List<LogEntry>(_logBuffer);
+            }
+            else
+            {
+                return BuildJsonObject("error", $"Unknown source '{source}'. Use 'file' or 'managed'.");
+            }
+
+            var minRank = LogLevelRank(minLevel);
+            entries = entries
+                .Where(e => LogLevelRank(e.Level) >= minRank)
+                .Where(e => string.IsNullOrEmpty(contains) || (e.Message != null && e.Message.IndexOf(contains, StringComparison.OrdinalIgnoreCase) >= 0))
+                .ToList();
+            entries = entries.Skip(Math.Max(0, entries.Count - count)).ToList();
 
             var sb = new StringBuilder();
             sb.AppendLine("{");
+            sb.AppendLine($"  \"source\": {JsonEscape(source)},");
+            if (logFile != null)
+                sb.AppendLine($"  \"logFile\": {JsonEscapePath(logFile)},");
             sb.AppendLine($"  \"count\": {entries.Count},");
             sb.AppendLine("  \"logs\": [");
 
@@ -204,6 +241,149 @@ namespace FlaxMCP
             sb.AppendLine("  ]");
             sb.Append("}");
             return sb.ToString();
+        }
+
+        private const long MaxLogReadBytes = 4 * 1024 * 1024;
+
+        private static readonly System.Text.RegularExpressions.Regex LogLineRegex =
+            new System.Text.RegularExpressions.Regex(@"^\[ (\d+:\d+:\d+\.\d+) \]: \[(\w+)\] ?(.*)$");
+
+        private static int LogLevelRank(string level)
+        {
+            switch ((level ?? "").ToLowerInvariant())
+            {
+                case "warning": return 1;
+                case "error": return 2;
+                case "exception": return 2;
+                case "fatal": return 3;
+                default: return 0;
+            }
+        }
+
+        /// <summary>
+        /// Reads the log file of the running editor. Unlike the managed log hook, this
+        /// includes messages from native code such as shader and material compilation.
+        /// Returns null when the file cannot be found.
+        /// </summary>
+        private List<LogEntry> ReadEditorLogFile(out string logFile)
+        {
+            var lines = ReadEditorLogLines(out logFile);
+            return lines != null ? ParseLogEntries(lines) : null;
+        }
+
+        /// <summary>
+        /// Groups raw log lines into entries; lines without a timestamp prefix continue the previous entry.
+        /// </summary>
+        private static List<LogEntry> ParseLogEntries(string[] lines)
+        {
+            var entries = new List<LogEntry>();
+            LogEntry current = null;
+            foreach (var rawLine in lines)
+            {
+                // Native messages can carry a trailing NUL from C strings.
+                var line = rawLine.Replace("\0", "");
+                var match = LogLineRegex.Match(line);
+                if (match.Success)
+                {
+                    current = new LogEntry
+                    {
+                        Timestamp = match.Groups[1].Value,
+                        Level = match.Groups[2].Value,
+                        Message = match.Groups[3].Value
+                    };
+                    entries.Add(current);
+                }
+                else if (current != null && line.Length > 0 && !line.StartsWith("===="))
+                {
+                    // Multi-line messages (stack traces, compiler output) continue without a prefix.
+                    current.Message += "\n" + line;
+                }
+            }
+            return entries;
+        }
+
+        /// <summary>
+        /// Reads the tail of the running editor's log file as raw lines, or null if it cannot be found.
+        /// </summary>
+        private string[] ReadEditorLogLines(out string logFile, long fromByte = -1)
+        {
+            logFile = FindEditorLogFile();
+            if (logFile == null)
+                return null;
+
+            string text;
+            using (var stream = new FileStream(logFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                var start = Math.Max(fromByte, stream.Length - MaxLogReadBytes);
+                start = Math.Clamp(start, 0, stream.Length);
+                start -= start % 2; // The file is UTF-16; keep character alignment.
+                stream.Position = start;
+                using (var reader = new StreamReader(stream, Encoding.Unicode, start == 0))
+                    text = reader.ReadToEnd();
+            }
+            return text.Split('\n').Select(l => l.TrimEnd('\r')).ToArray();
+        }
+
+        /// <summary>
+        /// Current size of the editor log file in bytes; pass it to <see cref="ReadEditorLogLines"/>
+        /// later to read only what was logged in between.
+        /// </summary>
+        private long GetEditorLogLength()
+        {
+            var logFile = FindEditorLogFile();
+            return logFile != null ? new FileInfo(logFile).Length : 0;
+        }
+
+        private string FindEditorLogFile()
+        {
+            var logsFolder = Path.Combine(_projectFolder, "Logs");
+            if (!Directory.Exists(logsFolder))
+                return null;
+            var processStart = System.Diagnostics.Process.GetCurrentProcess().StartTime.ToUniversalTime();
+            var files = new DirectoryInfo(logsFolder).GetFiles("Log_*.txt")
+                .OrderByDescending(f => f.CreationTimeUtc)
+                .ToList();
+            // Prefer the file this editor process created; fall back to the newest one.
+            var mine = files.FirstOrDefault(f => f.CreationTimeUtc >= processStart.AddSeconds(-5));
+            return (mine ?? files.FirstOrDefault())?.FullName;
+        }
+
+        private static bool IsShaderMessage(LogEntry e)
+        {
+            var m = e.Message ?? "";
+            return m.IndexOf("shader", StringComparison.OrdinalIgnoreCase) >= 0
+                || m.IndexOf("Failed to compile", StringComparison.OrdinalIgnoreCase) >= 0
+                || m.IndexOf(".hlsl", StringComparison.OrdinalIgnoreCase) >= 0
+                || m.IndexOf("material", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>
+        /// Returns shader and material compilation errors and warnings from the editor log file.
+        /// </summary>
+        private string ToolGetShaderErrors(Dictionary<string, object> args)
+        {
+            var count = Math.Clamp(GetArgInt(args, "count", 20), 1, MaxLogEntries);
+            var entries = ReadEditorLogFile(out var logFile);
+            if (entries == null)
+                return BuildJsonObject("error", "Could not find the editor log file.");
+
+            var matches = entries.Where(e => LogLevelRank(e.Level) >= 1 && IsShaderMessage(e)).ToList();
+            matches = matches.Skip(Math.Max(0, matches.Count - count)).ToList();
+
+            var result = new JObject
+            {
+                ["logFile"] = NormalizePath(logFile),
+                ["count"] = matches.Count,
+                ["errors"] = new JArray(matches.Select(e => new JObject
+                {
+                    ["level"] = e.Level,
+                    ["time"] = e.Timestamp,
+                    ["message"] = e.Message
+                })),
+            };
+            if (matches.Count == 0)
+                result["note"] = "No shader or material errors or warnings in this editor session's log.";
+            return result.ToString(Newtonsoft.Json.Formatting.Indented);
         }
 
         // ==================================================================
@@ -516,50 +696,78 @@ namespace FlaxMCP
             });
         }
 
+        private static readonly System.Text.RegularExpressions.Regex CompilerDiagnosticRegex =
+            new System.Text.RegularExpressions.Regex(@"(?<file>[A-Za-z]:[^:()]*?\.cs|[^\s()\]]+\.cs)\((?<pos>[\d,]+)\): (?<level>error|warning) (?<code>[A-Z]+\d+): (?<msg>.*)$");
+
         /// <summary>
-        /// Gets script compilation errors and warnings from the log buffer.
+        /// Gets C# compiler diagnostics from the most recent script compilation in the editor log.
         /// </summary>
         private string ToolGetScriptErrors(Dictionary<string, object> args)
         {
-            return InvokeOnMainThread(() =>
-            {
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                sb.AppendLine($"  \"hasCompilationErrors\": {(ScriptsBuilder.LastCompilationFailed ? "true" : "false")},");
-                sb.AppendLine($"  \"isCompiling\": {(ScriptsBuilder.IsCompiling ? "true" : "false")},");
+            var includeWarnings = GetArgBool(args, "includeWarnings", false);
+            var state = InvokeOnMainThread(() => new[] { ScriptsBuilder.LastCompilationFailed, ScriptsBuilder.IsCompiling });
 
+            var result = new JObject
+            {
+                ["hasCompilationErrors"] = state[0],
+                ["isCompiling"] = state[1],
+            };
+
+            var diagnostics = new JArray();
+            int errorCount = 0, warningCount = 0;
+            var lines = ReadEditorLogLines(out var logFile);
+            if (lines != null)
+            {
+                // Only look at output of the latest compilation; older errors are stale.
+                var start = Math.Max(0, Array.FindLastIndex(lines, l => l.Contains("Starting scripts compilation")));
+                var seen = new HashSet<string>();
+                for (var i = start; i < lines.Length; i++)
+                {
+                    var match = CompilerDiagnosticRegex.Match(lines[i]);
+                    if (!match.Success)
+                        continue;
+                    var key = match.Groups["file"].Value + match.Groups["pos"].Value + match.Groups["code"].Value;
+                    if (!seen.Add(key))
+                        continue; // Flax.Build echoes each diagnostic more than once.
+                    var level = match.Groups["level"].Value;
+                    if (level == "warning")
+                    {
+                        warningCount++;
+                        if (!includeWarnings)
+                            continue;
+                    }
+                    else
+                    {
+                        errorCount++;
+                    }
+                    diagnostics.Add(new JObject
+                    {
+                        ["level"] = level,
+                        ["code"] = match.Groups["code"].Value,
+                        ["file"] = NormalizePath(match.Groups["file"].Value),
+                        ["position"] = match.Groups["pos"].Value,
+                        ["message"] = match.Groups["msg"].Value.Trim(),
+                    });
+                }
+                result["logFile"] = NormalizePath(logFile);
+            }
+            else
+            {
                 List<LogEntry> entries;
                 lock (_logLock)
-                {
-                    entries = _logBuffer
-                        .Where(e => e.Level == "Error" || e.Level == "Warning")
-                        .Where(e => e.Message != null && (
-                            e.Message.Contains(".cs(") ||
-                            e.Message.Contains("error CS") ||
-                            e.Message.Contains("warning CS") ||
-                            e.Message.Contains("Compilation")))
-                        .ToList();
-                }
+                    entries = _logBuffer.Where(e => e.Level == "Error" && e.Message != null && e.Message.Contains("error CS")).ToList();
+                foreach (var e in entries)
+                    diagnostics.Add(new JObject { ["level"] = "error", ["message"] = e.Message });
+                errorCount = entries.Count;
+                result["note"] = "Editor log file not found; showing errors captured from managed logging only.";
+            }
 
-                sb.AppendLine($"  \"errorCount\": {entries.Count},");
-                sb.AppendLine("  \"errors\": [");
-
-                for (int i = 0; i < entries.Count; i++)
-                {
-                    var entry = entries[i];
-                    sb.AppendLine("    {");
-                    sb.AppendLine($"      \"level\": {JsonEscape(entry.Level)},");
-                    sb.AppendLine($"      \"message\": {JsonEscape(entry.Message)},");
-                    sb.AppendLine($"      \"timestamp\": {JsonEscape(entry.Timestamp)}");
-                    sb.Append("    }");
-                    if (i < entries.Count - 1) sb.Append(",");
-                    sb.AppendLine();
-                }
-
-                sb.AppendLine("  ]");
-                sb.Append("}");
-                return sb.ToString();
-            });
+            result["errorCount"] = errorCount;
+            result["warningCount"] = warningCount;
+            result["errors"] = diagnostics;
+            if (!includeWarnings && warningCount > 0)
+                result["warningsHidden"] = "Pass includeWarnings: true to list warnings.";
+            return result.ToString(Newtonsoft.Json.Formatting.Indented);
         }
 
         // ==================================================================
@@ -932,26 +1140,206 @@ namespace FlaxMCP
         // ==================================================================
 
         /// <summary>
-        /// Gets current frame timing and rendering statistics.
+        /// Gets current frame timing, CPU/GPU timings, draw statistics and memory usage.
         /// </summary>
         private string ToolGetFrameStats(Dictionary<string, object> args)
         {
             return InvokeOnMainThread(() =>
             {
-                var fps = Engine.FramesPerSecond;
-                var deltaTime = Time.DeltaTime;
-                var gameTime = Time.GameTime;
+                var stats = ProfilingTools.Stats;
+                var profilerEnabled = ProfilingTools.Enabled;
+                const double mb = 1024.0 * 1024.0;
 
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                sb.AppendLine($"  \"fps\": {fps},");
-                sb.AppendLine($"  \"deltaTime\": {deltaTime},");
-                sb.AppendLine($"  \"gameTime\": {gameTime},");
-                sb.AppendLine($"  \"unscaledDeltaTime\": {Time.UnscaledDeltaTime},");
-                sb.AppendLine($"  \"timeScale\": {Time.TimeScale}");
-                sb.Append("}");
-                return sb.ToString();
+                var result = new JObject
+                {
+                    ["fps"] = Engine.FramesPerSecond,
+                    ["deltaTime"] = Time.DeltaTime,
+                    ["gameTime"] = Time.GameTime,
+                    ["unscaledDeltaTime"] = Time.UnscaledDeltaTime,
+                    ["timeScale"] = Time.TimeScale,
+                    ["updateCpuMs"] = Math.Round(stats.UpdateTimeMs, 3),
+                    ["physicsCpuMs"] = Math.Round(stats.PhysicsTimeMs, 3),
+                    ["drawCpuMs"] = Math.Round(stats.DrawCPUTimeMs, 3),
+                    // GPU timings come from timer queries that only run while the profiler is on.
+                    ["drawGpuMs"] = profilerEnabled ? (JToken)Math.Round(stats.DrawGPUTimeMs, 3) : JValue.CreateNull(),
+                    ["drawCalls"] = stats.DrawStats.DrawCalls,
+                    ["triangles"] = stats.DrawStats.Triangles,
+                    ["vertices"] = stats.DrawStats.Vertices,
+                    ["gpuMemoryUsedMB"] = Math.Round(stats.MemoryGPU.Used / mb, 1),
+                    ["gpuMemoryTotalMB"] = Math.Round(stats.MemoryGPU.Total / mb, 1),
+                    ["processMemoryMB"] = Math.Round(stats.ProcessMemory.UsedPhysicalMemory / mb, 1),
+                    ["profilerEnabled"] = profilerEnabled,
+                };
+                if (!profilerEnabled)
+                    result["note"] = "drawGpuMs is null while the profiler is off. Use get_gpu_profile for GPU timings.";
+                return result.ToString(Newtonsoft.Json.Formatting.Indented);
             });
+        }
+
+        private struct GpuEventSample
+        {
+            public string Name;
+            public float TimeMs;
+            public int Depth;
+        }
+
+        private class GpuPassStats
+        {
+            public string Name;
+            public string Path;
+            public int Depth;
+            public int Order;
+            public double SumMs;
+            public float MaxMs;
+            public int Count;
+        }
+
+        /// <summary>
+        /// Turns the engine profiler on for a number of frames and returns averaged
+        /// GPU timings per rendering pass.
+        /// </summary>
+        private string ToolGetGpuProfile(Dictionary<string, object> args)
+        {
+            var frames = Math.Clamp(GetArgInt(args, "frames", 30), 1, 300);
+            var maxDepth = Math.Clamp(GetArgInt(args, "maxDepth", 3), 0, 32);
+            var minMs = Math.Max(0f, GetArgFloat(args, "minMs", 0.01f));
+
+            var wasEnabled = InvokeOnMainThread(() =>
+            {
+                var enabled = ProfilingTools.Enabled;
+                ProfilingTools.Enabled = true;
+                return enabled;
+            });
+
+            var passes = new Dictionary<string, GpuPassStats>();
+            var frameGpuMs = new List<float>();
+            long drawCalls = 0, triangles = 0;
+            var sampled = 0;
+            try
+            {
+                // GPU timer queries resolve a few frames late; skip those frames.
+                ulong lastFrame = InvokeOnMainThread(() => Engine.FrameCount) + 5;
+                var deadline = DateTime.UtcNow.AddSeconds(10 + frames * 0.25);
+                var stack = new string[64];
+                while (sampled < frames && DateTime.UtcNow < deadline)
+                {
+                    var snapshot = InvokeOnMainThread(() => CaptureGpuEvents(ref lastFrame));
+                    if (snapshot == null)
+                    {
+                        Thread.Sleep(5);
+                        continue;
+                    }
+
+                    sampled++;
+                    frameGpuMs.Add(snapshot.Value.FrameMs);
+                    drawCalls = snapshot.Value.DrawCalls;
+                    triangles = snapshot.Value.Triangles;
+                    foreach (var e in snapshot.Value.Events)
+                    {
+                        if (e.Depth < 0 || e.Depth >= stack.Length)
+                            continue;
+                        stack[e.Depth] = e.Name;
+                        var path = string.Join(" > ", stack, 0, e.Depth + 1);
+                        if (!passes.TryGetValue(path, out var pass))
+                        {
+                            pass = new GpuPassStats { Name = e.Name, Path = path, Depth = e.Depth, Order = passes.Count };
+                            passes[path] = pass;
+                        }
+                        pass.SumMs += e.TimeMs;
+                        pass.MaxMs = Math.Max(pass.MaxMs, e.TimeMs);
+                        pass.Count++;
+                    }
+                }
+            }
+            finally
+            {
+                if (!wasEnabled)
+                    InvokeOnMainThread(() => { ProfilingTools.Enabled = false; return true; });
+            }
+
+            if (sampled == 0)
+                return BuildJsonObject("error", "No GPU profiler data arrived. The editor may be minimized or not rendering.");
+
+            var avgFrame = frameGpuMs.Average();
+            double Avg(GpuPassStats p) => p.SumMs / sampled;
+
+            var passList = new JArray();
+            foreach (var p in passes.Values.OrderBy(p => p.Order))
+            {
+                if (p.Depth > maxDepth || Avg(p) < minMs)
+                    continue;
+                passList.Add(new JObject
+                {
+                    ["name"] = new string(' ', p.Depth * 2) + p.Name,
+                    ["depth"] = p.Depth,
+                    ["avgMs"] = Math.Round(Avg(p), 3),
+                    ["maxMs"] = Math.Round(p.MaxMs, 3),
+                    ["percentOfFrame"] = avgFrame > 0 ? Math.Round(Avg(p) / avgFrame * 100.0, 1) : 0,
+                });
+            }
+
+            var slowest = new JArray();
+            foreach (var p in passes.Values.Where(p => p.Depth > 0).OrderByDescending(Avg).Take(10))
+                slowest.Add(new JObject { ["path"] = p.Path, ["avgMs"] = Math.Round(Avg(p), 3) });
+
+            var result = new JObject
+            {
+                ["framesSampled"] = sampled,
+                ["gpuFrameMs"] = new JObject
+                {
+                    ["avg"] = Math.Round(avgFrame, 3),
+                    ["min"] = Math.Round(frameGpuMs.Min(), 3),
+                    ["max"] = Math.Round(frameGpuMs.Max(), 3),
+                },
+                ["drawCalls"] = drawCalls,
+                ["triangles"] = triangles,
+                ["slowestPasses"] = slowest,
+                ["passes"] = passList,
+                ["note"] = "Times cover every view the editor renders (editor viewport, game view, UI). Close or hide views you do not want measured.",
+            };
+            return result.ToString(Newtonsoft.Json.Formatting.Indented);
+        }
+
+        private struct GpuSnapshot
+        {
+            public float FrameMs;
+            public long DrawCalls;
+            public long Triangles;
+            public List<GpuEventSample> Events;
+        }
+
+        /// <summary>
+        /// Copies the last resolved GPU profiler frame. Returns null when no new frame is available.
+        /// Must run on the main thread.
+        /// </summary>
+        private static unsafe GpuSnapshot? CaptureGpuEvents(ref ulong lastFrame)
+        {
+            var frame = Engine.FrameCount;
+            if (frame <= lastFrame)
+                return null;
+            var events = ProfilingTools.EventsGPU;
+            if (events == null || events.Length == 0)
+                return null;
+            lastFrame = frame;
+
+            var list = new List<GpuEventSample>(events.Length);
+            foreach (var e in events)
+            {
+                list.Add(new GpuEventSample
+                {
+                    Name = e.Name != null ? new string(e.Name) : "(unnamed)",
+                    TimeMs = e.Time,
+                    Depth = e.Depth,
+                });
+            }
+            var stats = ProfilingTools.Stats;
+            return new GpuSnapshot
+            {
+                FrameMs = stats.DrawGPUTimeMs,
+                DrawCalls = stats.DrawStats.DrawCalls,
+                Triangles = stats.DrawStats.Triangles,
+                Events = list,
+            };
         }
 
         // ==================================================================

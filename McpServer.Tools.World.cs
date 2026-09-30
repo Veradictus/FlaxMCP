@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
+using System.Threading;
 using FlaxEditor;
 using FlaxEngine;
 
@@ -572,35 +574,156 @@ namespace FlaxMCP
         // TOOL HANDLERS: Rendering
         // ==================================================================
 
+        private const string ScreenshotFolderName = "McpScreenshots";
+        private const int MaxKeptScreenshots = 30;
+        private const long MaxInlineImageBytes = 4 * 1024 * 1024;
+
         /// <summary>
-        /// Captures a screenshot of the editor viewport to the specified path.
+        /// Legacy REST entry point: captures a screenshot and returns only the JSON text.
         /// </summary>
         private string ToolTakeScreenshot(Dictionary<string, object> args)
         {
-            var outputPath = GetArgString(args, "outputPath");
-            if (string.IsNullOrEmpty(outputPath))
-                return BuildJsonObject("error", "Missing 'outputPath' argument.");
+            var restArgs = new Dictionary<string, object>(args) { ["includeImage"] = false };
+            return ToolTakeScreenshotRich(restArgs).Text;
+        }
 
-            return InvokeOnMainThread(() =>
+        /// <summary>
+        /// Captures the editor viewport or the game view, waits until the file is written,
+        /// and returns the image inline.
+        /// </summary>
+        private ToolOutput ToolTakeScreenshotRich(Dictionary<string, object> args)
+        {
+            var output = new ToolOutput();
+            var source = (GetArgString(args, "source", "auto") ?? "auto").ToLowerInvariant();
+            var includeImage = GetArgBool(args, "includeImage", true);
+            var timeoutMs = Math.Max(1000, GetArgInt(args, "timeoutMs", 15000));
+            var outputPath = GetArgString(args, "outputPath");
+
+            if (source != "auto" && source != "editor" && source != "game")
             {
-                try
+                output.Text = BuildJsonObject("error", $"Unknown source '{source}'. Use 'auto', 'editor' or 'game'.");
+                return output;
+            }
+
+            string usedSource;
+            try
+            {
+                usedSource = InvokeOnMainThread(() =>
                 {
+                    var folder = Path.Combine(Globals.ProjectCacheFolder, ScreenshotFolderName);
+                    if (string.IsNullOrEmpty(outputPath))
+                        outputPath = Path.Combine(folder, $"Screenshot_{DateTime.Now:yyyyMMdd_HHmmss_fff}.jpg");
+                    else if (!Path.IsPathRooted(outputPath))
+                        outputPath = Path.Combine(Globals.ProjectFolder, outputPath);
+                    outputPath = Path.GetFullPath(outputPath);
+
                     var dir = Path.GetDirectoryName(outputPath);
                     if (dir != null)
                         Directory.CreateDirectory(dir);
+                    // Remove a stale file so the wait below only sees the new capture.
+                    if (File.Exists(outputPath))
+                        File.Delete(outputPath);
+                    PruneScreenshots(folder);
 
-                    Screenshot.Capture(outputPath);
+                    var chosen = source;
+                    if (chosen == "auto")
+                        chosen = Editor.Instance.StateMachine.IsPlayMode ? "game" : "editor";
 
-                    return BuildJsonObject(
-                        "ok", "true",
-                        "outputPath", outputPath
-                    );
-                }
-                catch (Exception ex)
+                    if (chosen == "game")
+                        Editor.Instance.Windows.GameWin.TakeScreenshot(outputPath);
+                    else
+                        Editor.Instance.Windows.EditWin.Viewport.TakeScreenshot(outputPath);
+                    return chosen;
+                });
+            }
+            catch (Exception ex)
+            {
+                output.Text = BuildJsonObject("error", $"Screenshot failed: {ex.Message}");
+                return output;
+            }
+
+            // The capture is written by an engine thread pool task after the GPU readback,
+            // so wait here (off the main thread) until the file is complete.
+            if (!WaitForCompleteFile(outputPath, timeoutMs, out var bytes))
+            {
+                output.Text = BuildJsonObject(
+                    "error", $"Screenshot was requested but no file appeared within {timeoutMs} ms. The {usedSource} view may not be visible or rendering.",
+                    "source", usedSource,
+                    "outputPath", NormalizePath(outputPath));
+                return output;
+            }
+
+            var mime = outputPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ? "image/png"
+                     : outputPath.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || outputPath.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ? "image/jpeg"
+                     : null;
+            var inlined = includeImage && mime != null && bytes.Length <= MaxInlineImageBytes;
+            if (inlined)
+                output.Images.Add((mime, Convert.ToBase64String(bytes)));
+
+            var note = !includeImage ? "Image not inlined (includeImage=false)."
+                     : mime == null ? "Image not inlined: only .jpg and .png can be returned inline."
+                     : !inlined ? $"Image not inlined: file is larger than {MaxInlineImageBytes / (1024 * 1024)} MB."
+                     : "Image attached.";
+            output.Text = BuildJsonObject(
+                "ok", "true",
+                "source", usedSource,
+                "outputPath", NormalizePath(outputPath),
+                "bytes", bytes.Length.ToString(),
+                "note", note);
+            return output;
+        }
+
+        private static bool WaitForCompleteFile(string path, int timeoutMs, out byte[] bytes)
+        {
+            bytes = null;
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            long lastLength = -1;
+            while (DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(100);
+                if (!File.Exists(path))
+                    continue;
+                try
                 {
-                    return BuildJsonObject("error", $"Screenshot failed: {ex.Message}");
+                    // Exclusive open fails while the engine is still writing the file.
+                    using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
+                    {
+                        if (stream.Length == 0 || stream.Length != lastLength)
+                        {
+                            lastLength = stream.Length;
+                            continue;
+                        }
+                        bytes = new byte[stream.Length];
+                        var read = 0;
+                        while (read < bytes.Length)
+                            read += stream.Read(bytes, read, bytes.Length - read);
+                        return true;
+                    }
                 }
-            });
+                catch (IOException)
+                {
+                    // Still being written.
+                }
+            }
+            return false;
+        }
+
+        private static void PruneScreenshots(string folder)
+        {
+            try
+            {
+                if (!Directory.Exists(folder))
+                    return;
+                var old = new DirectoryInfo(folder).GetFiles("Screenshot_*")
+                    .OrderByDescending(f => f.CreationTimeUtc)
+                    .Skip(MaxKeptScreenshots);
+                foreach (var file in old)
+                    file.Delete();
+            }
+            catch (IOException)
+            {
+                // Pruning is best effort.
+            }
         }
 
         /// <summary>
