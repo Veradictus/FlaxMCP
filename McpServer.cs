@@ -48,6 +48,9 @@ namespace FlaxMCP
         // Build status tracking
         private volatile string _buildStatus = "idle";
 
+        // Captured on the main thread at start so worker threads can use it.
+        private string _projectFolder;
+
         // ------------------------------------------------------------------
         // MCP tool definition
         // ------------------------------------------------------------------
@@ -84,6 +87,7 @@ namespace FlaxMCP
 
             try
             {
+                _projectFolder = Globals.ProjectFolder;
                 RegisterAllTools();
 
                 _listener = new HttpListener();

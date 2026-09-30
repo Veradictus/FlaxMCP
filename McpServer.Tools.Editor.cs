@@ -84,13 +84,24 @@ namespace FlaxMCP
                 sb.AppendLine($"  \"totalAssetCount\": {assetCount},");
 
                 // Recent errors
-                List<LogEntry> errors;
-                lock (_logLock)
+                // The log file also holds native errors (shaders, assets) the managed hook misses.
+                List<LogEntry> errors = null;
+                try
                 {
-                    errors = _logBuffer
-                        .Where(e => e.Level == "Error" || e.Level == "Exception")
-                        .TakeLast(10)
-                        .ToList();
+                    errors = ReadEditorLogFile(out _)?.Where(e => LogLevelRank(e.Level) >= 2).TakeLast(10).ToList();
+                }
+                catch (IOException)
+                {
+                }
+                if (errors == null)
+                {
+                    lock (_logLock)
+                    {
+                        errors = _logBuffer
+                            .Where(e => e.Level == "Error" || e.Level == "Exception")
+                            .TakeLast(10)
+                            .ToList();
+                    }
                 }
 
                 sb.AppendLine($"  \"recentErrorCount\": {errors.Count},");
@@ -177,17 +188,41 @@ namespace FlaxMCP
         private string ToolGetEditorLogs(Dictionary<string, object> args)
         {
             int count = GetArgInt(args, "count", 50);
-            count = Math.Min(count, MaxLogEntries);
+            count = Math.Clamp(count, 1, MaxLogEntries);
+            var source = (GetArgString(args, "source", "file") ?? "file").ToLowerInvariant();
+            var minLevel = GetArgString(args, "level");
+            var contains = GetArgString(args, "contains");
 
             List<LogEntry> entries;
-            lock (_logLock)
+            string logFile = null;
+            if (source == "file")
             {
-                var start = Math.Max(0, _logBuffer.Count - count);
-                entries = _logBuffer.GetRange(start, _logBuffer.Count - start);
+                entries = ReadEditorLogFile(out logFile);
+                if (entries == null)
+                    return BuildJsonObject("error", "Could not find the editor log file. Use source 'managed' for messages logged from C#.");
             }
+            else if (source == "managed")
+            {
+                lock (_logLock)
+                    entries = new List<LogEntry>(_logBuffer);
+            }
+            else
+            {
+                return BuildJsonObject("error", $"Unknown source '{source}'. Use 'file' or 'managed'.");
+            }
+
+            var minRank = LogLevelRank(minLevel);
+            entries = entries
+                .Where(e => LogLevelRank(e.Level) >= minRank)
+                .Where(e => string.IsNullOrEmpty(contains) || (e.Message != null && e.Message.IndexOf(contains, StringComparison.OrdinalIgnoreCase) >= 0))
+                .ToList();
+            entries = entries.Skip(Math.Max(0, entries.Count - count)).ToList();
 
             var sb = new StringBuilder();
             sb.AppendLine("{");
+            sb.AppendLine($"  \"source\": {JsonEscape(source)},");
+            if (logFile != null)
+                sb.AppendLine($"  \"logFile\": {JsonEscapePath(logFile)},");
             sb.AppendLine($"  \"count\": {entries.Count},");
             sb.AppendLine("  \"logs\": [");
 
@@ -206,6 +241,149 @@ namespace FlaxMCP
             sb.AppendLine("  ]");
             sb.Append("}");
             return sb.ToString();
+        }
+
+        private const long MaxLogReadBytes = 4 * 1024 * 1024;
+
+        private static readonly System.Text.RegularExpressions.Regex LogLineRegex =
+            new System.Text.RegularExpressions.Regex(@"^\[ (\d+:\d+:\d+\.\d+) \]: \[(\w+)\] ?(.*)$");
+
+        private static int LogLevelRank(string level)
+        {
+            switch ((level ?? "").ToLowerInvariant())
+            {
+                case "warning": return 1;
+                case "error": return 2;
+                case "exception": return 2;
+                case "fatal": return 3;
+                default: return 0;
+            }
+        }
+
+        /// <summary>
+        /// Reads the log file of the running editor. Unlike the managed log hook, this
+        /// includes messages from native code such as shader and material compilation.
+        /// Returns null when the file cannot be found.
+        /// </summary>
+        private List<LogEntry> ReadEditorLogFile(out string logFile)
+        {
+            var lines = ReadEditorLogLines(out logFile);
+            return lines != null ? ParseLogEntries(lines) : null;
+        }
+
+        /// <summary>
+        /// Groups raw log lines into entries; lines without a timestamp prefix continue the previous entry.
+        /// </summary>
+        private static List<LogEntry> ParseLogEntries(string[] lines)
+        {
+            var entries = new List<LogEntry>();
+            LogEntry current = null;
+            foreach (var rawLine in lines)
+            {
+                // Native messages can carry a trailing NUL from C strings.
+                var line = rawLine.Replace("\0", "");
+                var match = LogLineRegex.Match(line);
+                if (match.Success)
+                {
+                    current = new LogEntry
+                    {
+                        Timestamp = match.Groups[1].Value,
+                        Level = match.Groups[2].Value,
+                        Message = match.Groups[3].Value
+                    };
+                    entries.Add(current);
+                }
+                else if (current != null && line.Length > 0 && !line.StartsWith("===="))
+                {
+                    // Multi-line messages (stack traces, compiler output) continue without a prefix.
+                    current.Message += "\n" + line;
+                }
+            }
+            return entries;
+        }
+
+        /// <summary>
+        /// Reads the tail of the running editor's log file as raw lines, or null if it cannot be found.
+        /// </summary>
+        private string[] ReadEditorLogLines(out string logFile, long fromByte = -1)
+        {
+            logFile = FindEditorLogFile();
+            if (logFile == null)
+                return null;
+
+            string text;
+            using (var stream = new FileStream(logFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                var start = Math.Max(fromByte, stream.Length - MaxLogReadBytes);
+                start = Math.Clamp(start, 0, stream.Length);
+                start -= start % 2; // The file is UTF-16; keep character alignment.
+                stream.Position = start;
+                using (var reader = new StreamReader(stream, Encoding.Unicode, start == 0))
+                    text = reader.ReadToEnd();
+            }
+            return text.Split('\n').Select(l => l.TrimEnd('\r')).ToArray();
+        }
+
+        /// <summary>
+        /// Current size of the editor log file in bytes; pass it to <see cref="ReadEditorLogLines"/>
+        /// later to read only what was logged in between.
+        /// </summary>
+        private long GetEditorLogLength()
+        {
+            var logFile = FindEditorLogFile();
+            return logFile != null ? new FileInfo(logFile).Length : 0;
+        }
+
+        private string FindEditorLogFile()
+        {
+            var logsFolder = Path.Combine(_projectFolder, "Logs");
+            if (!Directory.Exists(logsFolder))
+                return null;
+            var processStart = System.Diagnostics.Process.GetCurrentProcess().StartTime.ToUniversalTime();
+            var files = new DirectoryInfo(logsFolder).GetFiles("Log_*.txt")
+                .OrderByDescending(f => f.CreationTimeUtc)
+                .ToList();
+            // Prefer the file this editor process created; fall back to the newest one.
+            var mine = files.FirstOrDefault(f => f.CreationTimeUtc >= processStart.AddSeconds(-5));
+            return (mine ?? files.FirstOrDefault())?.FullName;
+        }
+
+        private static bool IsShaderMessage(LogEntry e)
+        {
+            var m = e.Message ?? "";
+            return m.IndexOf("shader", StringComparison.OrdinalIgnoreCase) >= 0
+                || m.IndexOf("Failed to compile", StringComparison.OrdinalIgnoreCase) >= 0
+                || m.IndexOf(".hlsl", StringComparison.OrdinalIgnoreCase) >= 0
+                || m.IndexOf("material", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>
+        /// Returns shader and material compilation errors and warnings from the editor log file.
+        /// </summary>
+        private string ToolGetShaderErrors(Dictionary<string, object> args)
+        {
+            var count = Math.Clamp(GetArgInt(args, "count", 20), 1, MaxLogEntries);
+            var entries = ReadEditorLogFile(out var logFile);
+            if (entries == null)
+                return BuildJsonObject("error", "Could not find the editor log file.");
+
+            var matches = entries.Where(e => LogLevelRank(e.Level) >= 1 && IsShaderMessage(e)).ToList();
+            matches = matches.Skip(Math.Max(0, matches.Count - count)).ToList();
+
+            var result = new JObject
+            {
+                ["logFile"] = NormalizePath(logFile),
+                ["count"] = matches.Count,
+                ["errors"] = new JArray(matches.Select(e => new JObject
+                {
+                    ["level"] = e.Level,
+                    ["time"] = e.Timestamp,
+                    ["message"] = e.Message
+                })),
+            };
+            if (matches.Count == 0)
+                result["note"] = "No shader or material errors or warnings in this editor session's log.";
+            return result.ToString(Newtonsoft.Json.Formatting.Indented);
         }
 
         // ==================================================================
@@ -518,50 +696,78 @@ namespace FlaxMCP
             });
         }
 
+        private static readonly System.Text.RegularExpressions.Regex CompilerDiagnosticRegex =
+            new System.Text.RegularExpressions.Regex(@"(?<file>[A-Za-z]:[^:()]*?\.cs|[^\s()\]]+\.cs)\((?<pos>[\d,]+)\): (?<level>error|warning) (?<code>[A-Z]+\d+): (?<msg>.*)$");
+
         /// <summary>
-        /// Gets script compilation errors and warnings from the log buffer.
+        /// Gets C# compiler diagnostics from the most recent script compilation in the editor log.
         /// </summary>
         private string ToolGetScriptErrors(Dictionary<string, object> args)
         {
-            return InvokeOnMainThread(() =>
-            {
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                sb.AppendLine($"  \"hasCompilationErrors\": {(ScriptsBuilder.LastCompilationFailed ? "true" : "false")},");
-                sb.AppendLine($"  \"isCompiling\": {(ScriptsBuilder.IsCompiling ? "true" : "false")},");
+            var includeWarnings = GetArgBool(args, "includeWarnings", false);
+            var state = InvokeOnMainThread(() => new[] { ScriptsBuilder.LastCompilationFailed, ScriptsBuilder.IsCompiling });
 
+            var result = new JObject
+            {
+                ["hasCompilationErrors"] = state[0],
+                ["isCompiling"] = state[1],
+            };
+
+            var diagnostics = new JArray();
+            int errorCount = 0, warningCount = 0;
+            var lines = ReadEditorLogLines(out var logFile);
+            if (lines != null)
+            {
+                // Only look at output of the latest compilation; older errors are stale.
+                var start = Math.Max(0, Array.FindLastIndex(lines, l => l.Contains("Starting scripts compilation")));
+                var seen = new HashSet<string>();
+                for (var i = start; i < lines.Length; i++)
+                {
+                    var match = CompilerDiagnosticRegex.Match(lines[i]);
+                    if (!match.Success)
+                        continue;
+                    var key = match.Groups["file"].Value + match.Groups["pos"].Value + match.Groups["code"].Value;
+                    if (!seen.Add(key))
+                        continue; // Flax.Build echoes each diagnostic more than once.
+                    var level = match.Groups["level"].Value;
+                    if (level == "warning")
+                    {
+                        warningCount++;
+                        if (!includeWarnings)
+                            continue;
+                    }
+                    else
+                    {
+                        errorCount++;
+                    }
+                    diagnostics.Add(new JObject
+                    {
+                        ["level"] = level,
+                        ["code"] = match.Groups["code"].Value,
+                        ["file"] = NormalizePath(match.Groups["file"].Value),
+                        ["position"] = match.Groups["pos"].Value,
+                        ["message"] = match.Groups["msg"].Value.Trim(),
+                    });
+                }
+                result["logFile"] = NormalizePath(logFile);
+            }
+            else
+            {
                 List<LogEntry> entries;
                 lock (_logLock)
-                {
-                    entries = _logBuffer
-                        .Where(e => e.Level == "Error" || e.Level == "Warning")
-                        .Where(e => e.Message != null && (
-                            e.Message.Contains(".cs(") ||
-                            e.Message.Contains("error CS") ||
-                            e.Message.Contains("warning CS") ||
-                            e.Message.Contains("Compilation")))
-                        .ToList();
-                }
+                    entries = _logBuffer.Where(e => e.Level == "Error" && e.Message != null && e.Message.Contains("error CS")).ToList();
+                foreach (var e in entries)
+                    diagnostics.Add(new JObject { ["level"] = "error", ["message"] = e.Message });
+                errorCount = entries.Count;
+                result["note"] = "Editor log file not found; showing errors captured from managed logging only.";
+            }
 
-                sb.AppendLine($"  \"errorCount\": {entries.Count},");
-                sb.AppendLine("  \"errors\": [");
-
-                for (int i = 0; i < entries.Count; i++)
-                {
-                    var entry = entries[i];
-                    sb.AppendLine("    {");
-                    sb.AppendLine($"      \"level\": {JsonEscape(entry.Level)},");
-                    sb.AppendLine($"      \"message\": {JsonEscape(entry.Message)},");
-                    sb.AppendLine($"      \"timestamp\": {JsonEscape(entry.Timestamp)}");
-                    sb.Append("    }");
-                    if (i < entries.Count - 1) sb.Append(",");
-                    sb.AppendLine();
-                }
-
-                sb.AppendLine("  ]");
-                sb.Append("}");
-                return sb.ToString();
-            });
+            result["errorCount"] = errorCount;
+            result["warningCount"] = warningCount;
+            result["errors"] = diagnostics;
+            if (!includeWarnings && warningCount > 0)
+                result["warningsHidden"] = "Pass includeWarnings: true to list warnings.";
+            return result.ToString(Newtonsoft.Json.Formatting.Indented);
         }
 
         // ==================================================================
