@@ -322,12 +322,14 @@ namespace FlaxMCP
             // Rendering
             // ============================================================
 
-            RegisterTool("take_screenshot",
-                "Capture a screenshot of the editor viewport.",
-                SchemaObjectRequired(
-                    new[] { "outputPath" },
-                    SchemaPropStr("outputPath", "Absolute or project-relative output file path")),
-                ToolTakeScreenshot);
+            RegisterRichTool("take_screenshot",
+                "Capture the editor viewport or the game view and return the image. Waits until the file is written.",
+                SchemaObject(
+                    SchemaPropStr("source", "'auto' (game view while playing, otherwise editor viewport), 'editor' or 'game'. Default: auto"),
+                    SchemaPropStr("outputPath", "Absolute or project-relative file path (.jpg or .png). Default: a .jpg in Cache/McpScreenshots"),
+                    SchemaPropBool("includeImage", "Return the image inline (default: true)"),
+                    SchemaPropInt("timeoutMs", "How long to wait for the capture (default: 15000)")),
+                ToolTakeScreenshotRich);
 
             RegisterTool("get_rendering_settings",
                 "Get current rendering and post-processing settings.",

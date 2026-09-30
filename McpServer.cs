@@ -58,6 +58,16 @@ namespace FlaxMCP
             public string Description;
             public string InputSchemaJson;
             public Func<Dictionary<string, object>, string> Handler;
+            public Func<Dictionary<string, object>, ToolOutput> RichHandler;
+        }
+
+        /// <summary>
+        /// Result of a tool that returns images alongside its JSON text.
+        /// </summary>
+        private class ToolOutput
+        {
+            public string Text;
+            public List<(string MimeType, string Base64)> Images = new List<(string, string)>();
         }
 
         // ------------------------------------------------------------------
@@ -423,25 +433,49 @@ namespace FlaxMCP
             // Tool failures go in the result with isError so the calling model sees
             // them; JSON-RPC errors are reserved for protocol problems.
             string toolResult;
+            ToolOutput richResult = null;
             try
             {
-                toolResult = tool.Handler(args);
+                if (tool.RichHandler != null)
+                {
+                    richResult = tool.RichHandler(args);
+                    toolResult = richResult.Text;
+                }
+                else
+                {
+                    toolResult = tool.Handler(args);
+                }
             }
             catch (Exception ex)
             {
                 toolResult = BuildJsonObject("error", $"Tool '{toolName}' failed: {ex.Message}");
+                richResult = null;
+            }
+
+            var content = new JArray
+            {
+                new JObject
+                {
+                    ["type"] = "text",
+                    ["text"] = toolResult
+                }
+            };
+            if (richResult != null)
+            {
+                foreach (var image in richResult.Images)
+                {
+                    content.Add(new JObject
+                    {
+                        ["type"] = "image",
+                        ["data"] = image.Base64,
+                        ["mimeType"] = image.MimeType
+                    });
+                }
             }
 
             var resultObj = new JObject
             {
-                ["content"] = new JArray
-                {
-                    new JObject
-                    {
-                        ["type"] = "text",
-                        ["text"] = toolResult
-                    }
-                }
+                ["content"] = content
             };
             if (IsErrorResult(toolResult))
                 resultObj["isError"] = true;
@@ -551,6 +585,18 @@ namespace FlaxMCP
                 Description = description,
                 InputSchemaJson = inputSchemaJson,
                 Handler = handler
+            };
+        }
+
+        private void RegisterRichTool(string name, string description, string inputSchemaJson, Func<Dictionary<string, object>, ToolOutput> handler)
+        {
+            _tools[name] = new McpTool
+            {
+                Name = name,
+                Description = description,
+                InputSchemaJson = inputSchemaJson,
+                Handler = args => handler(args).Text,
+                RichHandler = handler
             };
         }
 
