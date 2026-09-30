@@ -466,7 +466,15 @@ namespace FlaxMCP
                 return BuildJsonObject("error", "Missing 'path' argument.");
 
             var projectFolder = InvokeOnMainThread(() => Globals.ProjectFolder);
-            var absPath = Path.Combine(projectFolder, path);
+            string absPath;
+            try
+            {
+                absPath = ResolveProjectPath(projectFolder, path);
+            }
+            catch (Exception ex)
+            {
+                return BuildJsonObject("error", ex.Message);
+            }
 
             if (!File.Exists(absPath))
                 return BuildJsonObject("error", $"File not found: {path}");

@@ -179,10 +179,23 @@ namespace FlaxMCP
 
             try
             {
-                // CORS headers for browser-based MCP clients
-                response.Headers.Add("Access-Control-Allow-Origin", "*");
-                response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-                response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
+                // Browsers attach an Origin header to cross-site requests. Without this
+                // check any web page open in the user's browser could drive the editor.
+                // Native MCP clients send no Origin; browser-based tools served from
+                // localhost (e.g. MCP Inspector) are still allowed.
+                var origin = context.Request.Headers["Origin"];
+                if (!string.IsNullOrEmpty(origin))
+                {
+                    if (!IsLocalOrigin(origin))
+                    {
+                        WriteJson(response, 403, BuildJsonObject("error", "Requests from web pages are not allowed.", "origin", origin));
+                        return;
+                    }
+                    response.Headers.Add("Access-Control-Allow-Origin", origin);
+                    response.Headers.Add("Vary", "Origin");
+                    response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                    response.Headers.Add("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Mcp-Protocol-Version");
+                }
 
                 if (context.Request.HttpMethod == "OPTIONS")
                 {
@@ -229,6 +242,27 @@ namespace FlaxMCP
                     // Ignore
                 }
             }
+        }
+
+        private static bool IsLocalOrigin(string origin)
+        {
+            if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri))
+                return false;
+            if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
+                return false;
+            return uri.Host == "localhost" || uri.Host == "127.0.0.1" || uri.Host == "[::1]";
+        }
+
+        /// <summary>
+        /// Resolves a project-relative path and rejects anything that escapes the project folder.
+        /// </summary>
+        private static string ResolveProjectPath(string projectFolder, string relativePath)
+        {
+            var root = Path.GetFullPath(projectFolder).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+            var full = Path.GetFullPath(Path.Combine(root, relativePath));
+            if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                throw new UnauthorizedAccessException($"Path is outside the project folder: {relativePath}");
+            return full;
         }
 
         // ------------------------------------------------------------------
