@@ -428,10 +428,8 @@ namespace FlaxMCP
                     return BuildJsonObject("error", $"No terrain surface found at X={xPos}, Z={zPos}");
 
                 return BuildJsonObject(
-                    "ok", "true",
+                    "error", "Not implemented: terrain sculpting is not supported, the heightmap was not changed.",
                     "terrain", terrain.Name,
-                    "note", "Terrain sculpt operations require the Editor sculpt tool. Use the editor viewport or terrain tool API for direct heightmap edits.",
-                    "position", $"X={xPos}, Z={zPos}",
                     "surfaceY", hit.Point.Y.ToString("F2")
                 );
             });
@@ -646,16 +644,11 @@ namespace FlaxMCP
         }
 
         /// <summary>
-        /// Updates rendering settings. Currently a placeholder for future expansion.
+        /// Placeholder kept for the legacy REST route; reports that nothing was changed.
         /// </summary>
         private string ToolSetRenderingSettings(Dictionary<string, object> args)
         {
-            return InvokeOnMainThread(() =>
-            {
-                // Graphics.HalfResolution is not available in Flax 1.11.
-                // Additional rendering settings can be added here as needed.
-                return BuildJsonObject("ok", "true", "status", "rendering settings updated");
-            });
+            return BuildJsonObject("error", "Not implemented: no rendering settings were changed.");
         }
 
         // ==================================================================

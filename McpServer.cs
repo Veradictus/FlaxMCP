@@ -177,6 +177,11 @@ namespace FlaxMCP
         {
             var response = context.Response;
 
+            // Responses are assembled with string interpolation; pin the culture so
+            // numbers never come out with a decimal comma (e.g. tr-TR, de-DE).
+            var previousCulture = Thread.CurrentThread.CurrentCulture;
+            Thread.CurrentThread.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+
             try
             {
                 // Browsers attach an Origin header to cross-site requests. Without this
@@ -241,6 +246,7 @@ namespace FlaxMCP
                 {
                     // Ignore
                 }
+                Thread.CurrentThread.CurrentCulture = previousCulture;
             }
         }
 
@@ -414,29 +420,51 @@ namespace FlaxMCP
                 }
             }
 
+            // Tool failures go in the result with isError so the calling model sees
+            // them; JSON-RPC errors are reserved for protocol problems.
+            string toolResult;
             try
             {
-                var toolResult = tool.Handler(args);
+                toolResult = tool.Handler(args);
+            }
+            catch (Exception ex)
+            {
+                toolResult = BuildJsonObject("error", $"Tool '{toolName}' failed: {ex.Message}");
+            }
 
-                var contentArray = new JArray
+            var resultObj = new JObject
+            {
+                ["content"] = new JArray
                 {
                     new JObject
                     {
                         ["type"] = "text",
                         ["text"] = toolResult
                     }
-                };
+                }
+            };
+            if (IsErrorResult(toolResult))
+                resultObj["isError"] = true;
 
-                var resultObj = new JObject
-                {
-                    ["content"] = contentArray
-                };
+            return BuildJsonRpcResult(id, resultObj);
+        }
 
-                return BuildJsonRpcResult(id, resultObj);
-            }
-            catch (Exception ex)
+        /// <summary>
+        /// Tool handlers report failure by returning a JSON object with an "error" field.
+        /// </summary>
+        private static bool IsErrorResult(string toolResult)
+        {
+            if (string.IsNullOrEmpty(toolResult) || toolResult.IndexOf("\"error\"", StringComparison.Ordinal) < 0)
+                return false;
+            try
             {
-                return BuildJsonRpcError(id, -1, $"Tool '{toolName}' failed: {ex.Message}");
+                var obj = JObject.Parse(toolResult);
+                var error = obj["error"];
+                return error != null && error.Type != JTokenType.Null;
+            }
+            catch (JsonException)
+            {
+                return false;
             }
         }
 
@@ -951,6 +979,8 @@ namespace FlaxMCP
 
             Scripting.InvokeOnUpdate(() =>
             {
+                var previousCulture = Thread.CurrentThread.CurrentCulture;
+                Thread.CurrentThread.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
                 try
                 {
                     result = func();
@@ -961,6 +991,7 @@ namespace FlaxMCP
                 }
                 finally
                 {
+                    Thread.CurrentThread.CurrentCulture = previousCulture;
                     done.Set();
                 }
             });

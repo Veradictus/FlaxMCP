@@ -262,7 +262,7 @@ curl -X POST http://localhost:9100/editor/play
 | `move_content` | Move or rename content. Args: `sourcePath`, `destPath` |
 | `get_import_status` | Check import queue status (isImporting, progress, batchSize) |
 
-### Materials (5)
+### Materials (7)
 | Tool | Description |
 |------|-------------|
 | `create_material` | Create base material. Args: `name`, `outputPath` |
@@ -270,6 +270,8 @@ curl -X POST http://localhost:9100/editor/play
 | `get_material_params` | Get material parameters. Args: `path` |
 | `set_material_param` | Set parameter on material instance. Args: `path`, `paramName`, `value` |
 | `set_model_material` | Assign material to model slot. Args: `actorName`/`actorId`, `materialPath`, `slotIndex` |
+| `build_pbr_material` | Build a PBR material with a full node graph (base color, normal, packed ORM, emissive). Args: `outputPath`, `name`, `roughnessDefault`, `metalnessDefault` |
+| `run_asset_pipeline` | Import textures, then models, then create materials from `material_mappings.json`. Args: `step` |
 
 ### Physics (4)
 | Tool | Description |
@@ -286,11 +288,10 @@ curl -X POST http://localhost:9100/editor/play
 | `play_animation` | Play/configure animation. Args: `actor`, `clip`, `speed`, `parameter`, `parameterValue` |
 | `get_animation_state` | Get animation state. Args: `actor` |
 
-### Terrain (3)
+### Terrain (2)
 | Tool | Description |
 |------|-------------|
 | `get_terrain_info` | Terrain details (patches, resolution) |
-| `terrain_sculpt` | Sculpt terrain. Args: `x`/`y`/`z`, `radius`, `strength` |
 | `get_terrain_height` | Sample height at point. Args: `x`, `z` |
 
 ### Navigation (3)
@@ -300,12 +301,11 @@ curl -X POST http://localhost:9100/editor/play
 | `query_navpath` | Query nav path. Args: `startX/Y/Z`, `endX/Y/Z` |
 | `get_navigation_info` | Nav volume info |
 
-### Rendering (3)
+### Rendering (2)
 | Tool | Description |
 |------|-------------|
 | `take_screenshot` | Capture viewport. Args: `outputPath` |
 | `get_rendering_settings` | Get PostFx volume settings |
-| `set_rendering_settings` | Update render settings |
 
 ### Audio (2)
 | Tool | Description |
@@ -397,6 +397,8 @@ AI Agent (Claude Code, Cursor, etc.)
         v
    Flax Editor Main Thread
 ```
+
+Tool failures are returned as MCP results with `isError: true`.
 
 Requests that carry a browser `Origin` header from anything other than `localhost` are rejected, so web pages cannot drive the editor. Native MCP clients send no `Origin` and are unaffected.
 
