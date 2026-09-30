@@ -699,9 +699,17 @@ namespace FlaxMCP
             // ============================================================
 
             RegisterTool("get_frame_stats",
-                "Get current frame timing and rendering statistics.",
+                "Get frame timing, CPU draw/update times, draw calls, triangles and memory. GPU time is only filled while the profiler is on.",
                 SchemaEmpty(),
                 ToolGetFrameStats);
+
+            RegisterTool("get_gpu_profile",
+                "Turn the GPU profiler on for a number of frames and return averaged GPU time per rendering pass, plus the slowest passes.",
+                SchemaObject(
+                    SchemaPropInt("frames", "Frames to average (default: 30, max: 300)"),
+                    SchemaPropInt("maxDepth", "Deepest pass nesting level to list (default: 3)"),
+                    SchemaPropNum("minMs", "Hide passes cheaper than this many milliseconds (default: 0.01)")),
+                ToolGetGpuProfile);
 
             // ============================================================
             // Editor Windows

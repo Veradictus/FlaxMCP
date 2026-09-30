@@ -4,9 +4,11 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 using FlaxEditor;
 using FlaxEditor.Content.Settings;
 using FlaxEngine;
+using Newtonsoft.Json.Linq;
 
 namespace FlaxMCP
 {
@@ -932,26 +934,206 @@ namespace FlaxMCP
         // ==================================================================
 
         /// <summary>
-        /// Gets current frame timing and rendering statistics.
+        /// Gets current frame timing, CPU/GPU timings, draw statistics and memory usage.
         /// </summary>
         private string ToolGetFrameStats(Dictionary<string, object> args)
         {
             return InvokeOnMainThread(() =>
             {
-                var fps = Engine.FramesPerSecond;
-                var deltaTime = Time.DeltaTime;
-                var gameTime = Time.GameTime;
+                var stats = ProfilingTools.Stats;
+                var profilerEnabled = ProfilingTools.Enabled;
+                const double mb = 1024.0 * 1024.0;
 
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                sb.AppendLine($"  \"fps\": {fps},");
-                sb.AppendLine($"  \"deltaTime\": {deltaTime},");
-                sb.AppendLine($"  \"gameTime\": {gameTime},");
-                sb.AppendLine($"  \"unscaledDeltaTime\": {Time.UnscaledDeltaTime},");
-                sb.AppendLine($"  \"timeScale\": {Time.TimeScale}");
-                sb.Append("}");
-                return sb.ToString();
+                var result = new JObject
+                {
+                    ["fps"] = Engine.FramesPerSecond,
+                    ["deltaTime"] = Time.DeltaTime,
+                    ["gameTime"] = Time.GameTime,
+                    ["unscaledDeltaTime"] = Time.UnscaledDeltaTime,
+                    ["timeScale"] = Time.TimeScale,
+                    ["updateCpuMs"] = Math.Round(stats.UpdateTimeMs, 3),
+                    ["physicsCpuMs"] = Math.Round(stats.PhysicsTimeMs, 3),
+                    ["drawCpuMs"] = Math.Round(stats.DrawCPUTimeMs, 3),
+                    // GPU timings come from timer queries that only run while the profiler is on.
+                    ["drawGpuMs"] = profilerEnabled ? (JToken)Math.Round(stats.DrawGPUTimeMs, 3) : JValue.CreateNull(),
+                    ["drawCalls"] = stats.DrawStats.DrawCalls,
+                    ["triangles"] = stats.DrawStats.Triangles,
+                    ["vertices"] = stats.DrawStats.Vertices,
+                    ["gpuMemoryUsedMB"] = Math.Round(stats.MemoryGPU.Used / mb, 1),
+                    ["gpuMemoryTotalMB"] = Math.Round(stats.MemoryGPU.Total / mb, 1),
+                    ["processMemoryMB"] = Math.Round(stats.ProcessMemory.UsedPhysicalMemory / mb, 1),
+                    ["profilerEnabled"] = profilerEnabled,
+                };
+                if (!profilerEnabled)
+                    result["note"] = "drawGpuMs is null while the profiler is off. Use get_gpu_profile for GPU timings.";
+                return result.ToString(Newtonsoft.Json.Formatting.Indented);
             });
+        }
+
+        private struct GpuEventSample
+        {
+            public string Name;
+            public float TimeMs;
+            public int Depth;
+        }
+
+        private class GpuPassStats
+        {
+            public string Name;
+            public string Path;
+            public int Depth;
+            public int Order;
+            public double SumMs;
+            public float MaxMs;
+            public int Count;
+        }
+
+        /// <summary>
+        /// Turns the engine profiler on for a number of frames and returns averaged
+        /// GPU timings per rendering pass.
+        /// </summary>
+        private string ToolGetGpuProfile(Dictionary<string, object> args)
+        {
+            var frames = Math.Clamp(GetArgInt(args, "frames", 30), 1, 300);
+            var maxDepth = Math.Clamp(GetArgInt(args, "maxDepth", 3), 0, 32);
+            var minMs = Math.Max(0f, GetArgFloat(args, "minMs", 0.01f));
+
+            var wasEnabled = InvokeOnMainThread(() =>
+            {
+                var enabled = ProfilingTools.Enabled;
+                ProfilingTools.Enabled = true;
+                return enabled;
+            });
+
+            var passes = new Dictionary<string, GpuPassStats>();
+            var frameGpuMs = new List<float>();
+            long drawCalls = 0, triangles = 0;
+            var sampled = 0;
+            try
+            {
+                // GPU timer queries resolve a few frames late; skip those frames.
+                ulong lastFrame = InvokeOnMainThread(() => Engine.FrameCount) + 5;
+                var deadline = DateTime.UtcNow.AddSeconds(10 + frames * 0.25);
+                var stack = new string[64];
+                while (sampled < frames && DateTime.UtcNow < deadline)
+                {
+                    var snapshot = InvokeOnMainThread(() => CaptureGpuEvents(ref lastFrame));
+                    if (snapshot == null)
+                    {
+                        Thread.Sleep(5);
+                        continue;
+                    }
+
+                    sampled++;
+                    frameGpuMs.Add(snapshot.Value.FrameMs);
+                    drawCalls = snapshot.Value.DrawCalls;
+                    triangles = snapshot.Value.Triangles;
+                    foreach (var e in snapshot.Value.Events)
+                    {
+                        if (e.Depth < 0 || e.Depth >= stack.Length)
+                            continue;
+                        stack[e.Depth] = e.Name;
+                        var path = string.Join(" > ", stack, 0, e.Depth + 1);
+                        if (!passes.TryGetValue(path, out var pass))
+                        {
+                            pass = new GpuPassStats { Name = e.Name, Path = path, Depth = e.Depth, Order = passes.Count };
+                            passes[path] = pass;
+                        }
+                        pass.SumMs += e.TimeMs;
+                        pass.MaxMs = Math.Max(pass.MaxMs, e.TimeMs);
+                        pass.Count++;
+                    }
+                }
+            }
+            finally
+            {
+                if (!wasEnabled)
+                    InvokeOnMainThread(() => { ProfilingTools.Enabled = false; return true; });
+            }
+
+            if (sampled == 0)
+                return BuildJsonObject("error", "No GPU profiler data arrived. The editor may be minimized or not rendering.");
+
+            var avgFrame = frameGpuMs.Average();
+            double Avg(GpuPassStats p) => p.SumMs / sampled;
+
+            var passList = new JArray();
+            foreach (var p in passes.Values.OrderBy(p => p.Order))
+            {
+                if (p.Depth > maxDepth || Avg(p) < minMs)
+                    continue;
+                passList.Add(new JObject
+                {
+                    ["name"] = new string(' ', p.Depth * 2) + p.Name,
+                    ["depth"] = p.Depth,
+                    ["avgMs"] = Math.Round(Avg(p), 3),
+                    ["maxMs"] = Math.Round(p.MaxMs, 3),
+                    ["percentOfFrame"] = avgFrame > 0 ? Math.Round(Avg(p) / avgFrame * 100.0, 1) : 0,
+                });
+            }
+
+            var slowest = new JArray();
+            foreach (var p in passes.Values.Where(p => p.Depth > 0).OrderByDescending(Avg).Take(10))
+                slowest.Add(new JObject { ["path"] = p.Path, ["avgMs"] = Math.Round(Avg(p), 3) });
+
+            var result = new JObject
+            {
+                ["framesSampled"] = sampled,
+                ["gpuFrameMs"] = new JObject
+                {
+                    ["avg"] = Math.Round(avgFrame, 3),
+                    ["min"] = Math.Round(frameGpuMs.Min(), 3),
+                    ["max"] = Math.Round(frameGpuMs.Max(), 3),
+                },
+                ["drawCalls"] = drawCalls,
+                ["triangles"] = triangles,
+                ["slowestPasses"] = slowest,
+                ["passes"] = passList,
+                ["note"] = "Times cover every view the editor renders (editor viewport, game view, UI). Close or hide views you do not want measured.",
+            };
+            return result.ToString(Newtonsoft.Json.Formatting.Indented);
+        }
+
+        private struct GpuSnapshot
+        {
+            public float FrameMs;
+            public long DrawCalls;
+            public long Triangles;
+            public List<GpuEventSample> Events;
+        }
+
+        /// <summary>
+        /// Copies the last resolved GPU profiler frame. Returns null when no new frame is available.
+        /// Must run on the main thread.
+        /// </summary>
+        private static unsafe GpuSnapshot? CaptureGpuEvents(ref ulong lastFrame)
+        {
+            var frame = Engine.FrameCount;
+            if (frame <= lastFrame)
+                return null;
+            var events = ProfilingTools.EventsGPU;
+            if (events == null || events.Length == 0)
+                return null;
+            lastFrame = frame;
+
+            var list = new List<GpuEventSample>(events.Length);
+            foreach (var e in events)
+            {
+                list.Add(new GpuEventSample
+                {
+                    Name = e.Name != null ? new string(e.Name) : "(unnamed)",
+                    TimeMs = e.Time,
+                    Depth = e.Depth,
+                });
+            }
+            var stats = ProfilingTools.Stats;
+            return new GpuSnapshot
+            {
+                FrameMs = stats.DrawGPUTimeMs,
+                DrawCalls = stats.DrawStats.DrawCalls,
+                Triangles = stats.DrawStats.Triangles,
+                Events = list,
+            };
         }
 
         // ==================================================================
