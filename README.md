@@ -1,6 +1,6 @@
 # FlaxMCP
 
-MCP server for [Flax Engine](https://flaxengine.com/). Lets AI agents control the Flax Editor over HTTP with **87 tools** for scene management, asset pipelines, materials, physics, animation, rendering, and more.
+MCP server for [Flax Engine](https://flaxengine.com/). Lets AI agents control the Flax Editor over HTTP with **90 tools** for scene management, asset pipelines, materials, physics, animation, rendering, and more.
 
 Runs as an editor plugin on `localhost:9100`. Supports both the MCP protocol (JSON-RPC 2.0) and plain REST endpoints.
 
@@ -201,7 +201,7 @@ curl http://localhost:9100/scene/hierarchy
 curl -X POST http://localhost:9100/editor/play
 ```
 
-## Tools (87)
+## Tools (90)
 
 ### Health & Status (4)
 | Tool | Description |
@@ -209,7 +209,7 @@ curl -X POST http://localhost:9100/editor/play
 | `get_health` | Server status, engine version, play mode |
 | `get_project_status` | Compile status, scene count, asset count, recent errors |
 | `get_editor_state` | Editor state, play mode, loaded scenes, selection, undo state |
-| `get_editor_logs` | Recent log entries. Args: `count` |
+| `get_editor_logs` | Recent entries from the editor log file, including native engine messages (shaders, assets). Args: `count`, `level`, `contains`, `source` (`file`/`managed`) |
 
 ### Scene (17)
 | Tool | Description |
@@ -301,10 +301,20 @@ curl -X POST http://localhost:9100/editor/play
 | `query_navpath` | Query nav path. Args: `startX/Y/Z`, `endX/Y/Z` |
 | `get_navigation_info` | Nav volume info |
 
-### Rendering (2)
+### Rendering (1)
 | Tool | Description |
 |------|-------------|
-| `take_screenshot` | Capture viewport. Args: `outputPath` |
+| `take_screenshot` | Capture the editor viewport or game view, wait until it is written, and return the image inline. Args: `source` (`auto`/`editor`/`game`), `outputPath`, `includeImage`, `timeoutMs` |
+
+### Profiling (2)
+| Tool | Description |
+|------|-------------|
+| `get_frame_stats` | FPS, CPU update/physics/draw times, draw calls, triangles, GPU and process memory (GPU time only while the profiler is on) |
+| `get_gpu_profile` | Enable the profiler for N frames and return averaged GPU time per rendering pass and the slowest passes. Args: `frames`, `maxDepth`, `minMs` |
+
+### Rendering Settings (1)
+| Tool | Description |
+|------|-------------|
 | `get_rendering_settings` | Get PostFx volume settings |
 
 ### Audio (2)
@@ -320,7 +330,7 @@ curl -X POST http://localhost:9100/editor/play
 | `list_prefabs` | List prefab assets in project |
 | `create_prefab` | Create prefab from scene actor. Args: `actorName`/`actorId`, `outputPath` |
 
-### Editor Control (12)
+### Editor Control (11)
 | Tool | Description |
 |------|-------------|
 | `editor_play` | Enter play mode |
@@ -334,7 +344,6 @@ curl -X POST http://localhost:9100/editor/play
 | `get_viewport` | Get viewport camera position and orientation |
 | `set_viewport` | Set viewport camera. Args: `positionX/Y/Z`, `yaw`, `pitch` |
 | `get_editor_windows` | List all editor windows and visibility |
-| `get_frame_stats` | FPS, delta time, time scale |
 
 ### Colliders (1)
 | Tool | Description |
@@ -347,7 +356,13 @@ curl -X POST http://localhost:9100/editor/play
 | `list_scripts` | List C# script files in Source folder |
 | `read_script` | Read script source. Args: `path` |
 | `compile_scripts` | Trigger script compilation |
-| `get_script_errors` | Get compilation errors |
+| `get_script_errors` | C# compiler errors from the latest compilation (file, position, code, message). Args: `includeWarnings` |
+
+### Shaders (2)
+| Tool | Description |
+|------|-------------|
+| `compile_shader` | Compile `Source/Shaders/*.shader` (imports into `Content/Shaders` when new or changed) and return whether it compiled plus compiler errors. Args: `path`, `timeoutMs` |
+| `get_shader_errors` | Shader and material compilation errors and warnings from this session's log. Args: `count` |
 
 ### Build (2)
 | Tool | Description |
@@ -375,8 +390,10 @@ FlaxMCP/
   McpServer.Tools.Scene.cs      Scene, actor, transform, tags, hierarchy tools
   McpServer.Tools.Content.cs    Assets, content DB, import, folders tools
   McpServer.Tools.Materials.cs  Material creation, params, model material assignment
+  McpServer.Tools.MaterialGraph.cs  PBR material graph builder, asset pipeline
   McpServer.Tools.World.cs      Physics, terrain, nav, rendering, animation, audio, prefabs, colliders
-  McpServer.Tools.Editor.cs     Editor control, scripts, build, settings, batch execute
+  McpServer.Tools.Editor.cs     Editor control, logs, profiling, scripts, build, settings, batch execute
+  McpServer.Tools.Shaders.cs    Shader source compilation
   McpServer.Rest.cs             Legacy REST endpoint routing + request DTOs
 ```
 
