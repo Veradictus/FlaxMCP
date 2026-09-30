@@ -398,6 +398,8 @@ AI Agent (Claude Code, Cursor, etc.)
    Flax Editor Main Thread
 ```
 
+Requests that carry a browser `Origin` header from anything other than `localhost` are rejected, so web pages cannot drive the editor. Native MCP clients send no `Origin` and are unaffected.
+
 The `/mcp` endpoint handles the MCP protocol. All other paths (`/health`, `/scene/hierarchy`, etc.) serve as a plain REST API for direct access via curl or scripts.
 
 ## Requirements
