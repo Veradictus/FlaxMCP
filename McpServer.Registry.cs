@@ -288,15 +288,7 @@ namespace FlaxMCP
                 SchemaEmpty(),
                 ToolGetTerrainInfo);
 
-            RegisterTool("terrain_sculpt",
-                "Sculpt terrain at a world position.",
-                SchemaObject(
-                    SchemaPropStr("terrainName", "Terrain actor name (uses first if omitted)"),
-                    SchemaPropNum("x", "World X position"),
-                    SchemaPropNum("z", "World Z position"),
-                    SchemaPropNum("radius", "Brush radius (default: 5)"),
-                    SchemaPropNum("strength", "Brush strength (default: 0.5)")),
-                ToolTerrainSculpt);
+            // terrain_sculpt is intentionally not registered: it never modified the heightmap.
 
             RegisterTool("get_terrain_height",
                 "Sample terrain height at a world X/Z position.",
@@ -342,11 +334,7 @@ namespace FlaxMCP
                 SchemaEmpty(),
                 ToolGetRenderingSettings);
 
-            RegisterTool("set_rendering_settings",
-                "Update rendering settings.",
-                SchemaObject(
-                    SchemaPropAny("settings", "Rendering setting key-value pairs")),
-                ToolSetRenderingSettings);
+            // set_rendering_settings is intentionally not registered: it changed nothing.
 
             // ============================================================
             // Audio
