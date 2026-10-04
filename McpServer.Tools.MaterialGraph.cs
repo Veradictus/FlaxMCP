@@ -145,14 +145,18 @@ namespace FlaxMCP
             const uint nodeIdEmissive  = 5;
             const uint nodeIdRoughness = 6;
             const uint nodeIdMetalness = 7;
+            const uint nodeIdNormalSampler = 8;
 
             // Node types: packed as (GroupID << 16) | TypeID
             // GroupID=1 Material, TypeID=1 Material Output
             // GroupID=6 Parameters, TypeID=1 Get Parameter
             const uint typeMaterial = (1 << 16) | 1;
             const uint typeGetParam = (6 << 16) | 1;
+            // GroupID=5 Textures, TypeID=4 Normal Map: samples a texture and unpacks it to a
+            // tangent-space vector. Its Object input takes the texture from a parameter.
+            const uint typeNormalMap = (5 << 16) | 4;
 
-            const int nodeCount = 7;
+            const int nodeCount = 8;
             const int paramCount = 6;
 
             using (var stream = new MemoryStream())
@@ -177,6 +181,7 @@ namespace FlaxMCP
                 w.Write(nodeIdEmissive);  w.Write(typeGetParam);
                 w.Write(nodeIdRoughness); w.Write(typeGetParam);
                 w.Write(nodeIdMetalness); w.Write(typeGetParam);
+                w.Write(nodeIdNormalSampler); w.Write(typeNormalMap);
 
                 // =============================================================
                 // PARAMETERS
@@ -254,8 +259,8 @@ namespace FlaxMCP
                 // Box 7: AO <- ORM node box 2 (R channel)
                 WriteBox(w, 7, VT_Float, nodeIdORM, 2);
 
-                // Box 8: Normal <- Normal node box 1 (Vector output)
-                WriteBox(w, 8, VT_Float3, nodeIdNormal, 1);
+                // Box 8: Normal <- Normal Map sampler box 1 (unpacked vector)
+                WriteBox(w, 8, VT_Float3, nodeIdNormalSampler, 1);
 
                 // Box 9: Opacity (no connections)
                 WriteBox(w, 9, VT_Float);
@@ -287,10 +292,11 @@ namespace FlaxMCP
                     0f, -200f);
 
                 // ----- Node 3: Get Parameter (NormalMap) -----
-                // Output box 1 -> Material box 8
-                WriteTextureGetParamNode(w, paramNormal,
-                    1, nodeIdMaterial, 8,
-                    0f, 400f);
+                // Object box 6 -> Normal Map sampler box 6. The raw colour must not
+                // feed Normal directly: (0.5, 0.5, 1) would tilt every normal.
+                WriteTextureGetParamNodeObject(w, paramNormal,
+                    nodeIdNormalSampler, 6,
+                    -250f, 400f);
 
                 // ----- Node 4: Get Parameter (ORMMap) -----
                 // Outputs: box 2(R)->Material 7(AO), box 3(G)->Material 6(Roughness),
@@ -311,6 +317,11 @@ namespace FlaxMCP
                 // ----- Node 7: Get Parameter (MetalnessValue) -----
                 // Float parameter with box 0 (value output), no connections.
                 WriteFloatGetParamNode(w, paramMetalness, 0f, 850f);
+
+                // ----- Node 8: Normal Map sampler -----
+                // Object box 6 <- NormalMap parameter, box 1 (Float3) -> Material box 8
+                WriteNormalMapSamplerNode(w, nodeIdNormal, 6, nodeIdMaterial, 8,
+                    0f, 400f);
 
                 // =============================================================
                 // VISJECT SURFACE META (view position etc.)
@@ -513,6 +524,53 @@ namespace FlaxMCP
         /// to the specified material input. All other boxes are written with
         /// zero connections.
         /// </summary>
+        /// <summary>
+        /// Writes a Get Parameter node for a Texture parameter whose Object output
+        /// (box 6) feeds another node, such as a Normal Map sampler.
+        /// </summary>
+        private static void WriteTextureGetParamNodeObject(BinaryWriter w, Guid paramId,
+            uint targetNodeId, byte targetBoxId, float posX, float posY)
+        {
+            // Values: [0] = parameter Guid
+            w.Write(1);
+            WriteVariantGuid(w, paramId);
+
+            w.Write((ushort)7);
+            WriteBox(w, 0, VT_Float2);
+            WriteBox(w, 6, VT_Object, targetNodeId, targetBoxId);
+            WriteBox(w, 1, VT_Float4);
+            WriteBox(w, 2, VT_Float);
+            WriteBox(w, 3, VT_Float);
+            WriteBox(w, 4, VT_Float);
+            WriteBox(w, 5, VT_Float);
+
+            WriteNodeMeta(w, posX, posY);
+        }
+
+        /// <summary>
+        /// Writes a Normal Map sampler node (Textures group, type 4) with no texture
+        /// of its own. Box layout matches the engine's default material:
+        /// 0 UVs, 1 Vector (Float3), 2-4 X/Y/Z, 6 Object input.
+        /// </summary>
+        private static void WriteNormalMapSamplerNode(BinaryWriter w,
+            uint sourceNodeId, byte sourceBoxId, uint targetNodeId, byte targetBoxId,
+            float posX, float posY)
+        {
+            // Values: [0] = texture asset Guid (empty; the texture comes from box 6)
+            w.Write(1);
+            WriteVariantGuid(w, Guid.Empty);
+
+            w.Write((ushort)6);
+            WriteBox(w, 0, VT_Float2);
+            WriteBox(w, 1, VT_Float3, targetNodeId, targetBoxId);
+            WriteBox(w, 2, VT_Float);
+            WriteBox(w, 3, VT_Float);
+            WriteBox(w, 4, VT_Float);
+            WriteBox(w, 6, VT_Object, sourceNodeId, sourceBoxId);
+
+            WriteNodeMeta(w, posX, posY);
+        }
+
         private static void WriteTextureGetParamNode(BinaryWriter w, Guid paramId,
             byte connectedBoxId, uint materialNodeId, byte materialBoxId,
             float posX, float posY)
